@@ -2,6 +2,40 @@
 
 一个基于Xilinx KV260平台的端到端医学图像处理流水线系统，集成了数据预处理、AI分割和三维重建功能。
 
+## 🚀 快速开始 - 5分钟看到效果！
+
+### 方法1: 一键运行批处理脚本（最简单）
+```bash
+# Windows用户直接双击运行
+run_full_demo.bat
+
+# 或者使用命令行
+.\run_full_demo.bat
+```
+
+### 方法2: Jupyter Notebook交互式演示（推荐）
+```bash
+# 安装Jupyter
+pip install jupyter numpy plotly matplotlib
+
+# 启动notebook
+jupyter notebook Quick_Start_Demo.ipynb
+```
+
+### 方法3: Python可视化脚本
+```bash
+# 先生成VTK文件（如果还没有）
+cd marching_cubes_c
+# ... 编译和运行 ...
+
+# 然后可视化
+python quick_demo_viewer.py marching_cubes_c/out.vtk
+```
+
+📖 **详细说明**: 查看 [quick_demo.md](quick_demo.md)
+
+---
+
 ## 项目概述
 
 本项目实现了一个完整的医学图像处理工作流程，从原始医学图像（DICOM/NIfTI格式）开始，经过预处理、AI分割、三维重建，最终生成可视化结果。项目采用软硬件协同设计，支持CPU和FPGA加速处理。
