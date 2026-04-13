@@ -25,6 +25,7 @@ import glob
 import os
 import sys
 import datetime
+import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -50,16 +51,26 @@ except Exception:
 class DicomTrachea3DPipeline:
     """DICOM气管3D重建 + 中心线提取完整流程"""
     
-    def __init__(self, dicom_dir, output_name="trachea_reconstruction"):
+    def __init__(
+        self,
+        dicom_dir,
+        output_name="trachea_reconstruction",
+        *,
+        percentile=36.5,
+        closing_iters=2,
+        erosion_iters=1,
+    ):
         self.dicom_dir = dicom_dir
         self.output_name = output_name
         
         # 算法参数(来自analyze_dicom_improved.py)
-        self.percentile = 40        # 40%分位阈值（选择较黑的气管区域）
+        self.percentile = float(percentile)  # 分位阈值（越小越保守，区域越窄；支持小数）
         self.roi_size = 300         # ROI大小
         self.area_min = 30          # 最小面积（只过滤噪声）
         self.area_max = float('inf') # 不限制上限
         self.kernel_size = (3, 3)   # 形态学核
+        self.closing_iters = int(closing_iters)
+        self.erosion_iters = int(erosion_iters)
         
         # 数据
         self.slices_data = []       # [(z_pos, ds, pixel_array), ...]
@@ -69,6 +80,10 @@ class DicomTrachea3DPipeline:
         self.downsample_size = None  # 记录降采样尺寸
         self.original_size = None    # 记录原始尺寸
         self.cross_section_analysis = []  # 保存横截面分析结果
+        # 运行/实验信息（由main注入，用于写入HTML底部）
+        self.experiment_intro = ""
+        self.experiment_args = {}
+        self.experiment_started_at = None  # datetime.datetime
     
     def step1_load_and_sort_dicom(self, z_min=None, z_max=None):
         """步骤1: 加载DICOM并按ImagePositionPatient的Z坐标排序"""
@@ -1331,10 +1346,15 @@ class DicomTrachea3DPipeline:
         
         # 使用小的3D结构元素进行闭合操作
         structure_close = ndimage.generate_binary_structure(3, 1)  # 6邻域
-        volume_closed = binary_closing(volume_binary, structure=structure_close, iterations=2)
+        volume_closed = binary_closing(volume_binary, structure=structure_close, iterations=self.closing_iters)
         
         # 再轻微腐蚀，移除闭合时可能产生的伪影
-        volume_binary = binary_erosion(volume_closed, structure=structure_close, iterations=1).astype(np.uint8)
+        if self.erosion_iters > 0:
+            volume_binary = binary_erosion(
+                volume_closed, structure=structure_close, iterations=self.erosion_iters
+            ).astype(np.uint8)
+        else:
+            volume_binary = volume_closed.astype(np.uint8)
         
         closed_voxels = np.sum(volume_binary > 0)
         print(f"   闭合后体素: {closed_voxels:,}")
@@ -1904,7 +1924,7 @@ class DicomTrachea3DPipeline:
         
         return selected_labels
     
-    def _add_flood_fill_mesh_to_figure(self, fig):
+    def _add_flood_fill_mesh_to_figure(self, fig, *, color='red', opacity=0.3, name='充气法区域', visible=True):
         """
         在3D图中添加充气法选中区域的可视化
         用半透明红色网格显示，帮助调试充气是否泄漏
@@ -1961,7 +1981,7 @@ class DicomTrachea3DPipeline:
             
             new_verts[:, 2] = z_physical
             
-            # 添加到图中（半透明红色）
+            # 添加到图中
             fig.add_trace(go.Mesh3d(
                 x=new_verts[:, 0],
                 y=new_verts[:, 1],
@@ -1969,20 +1989,20 @@ class DicomTrachea3DPipeline:
                 i=faces[:, 0],
                 j=faces[:, 1],
                 k=faces[:, 2],
-                color='red',
-                opacity=0.3,  # 半透明
+                color=color,
+                opacity=opacity,
                 lighting=dict(
                     ambient=0.8,
                     diffuse=0.5,
                     roughness=0.9,
                     specular=0.1
                 ),
-                name='充气法区域',
+                name=name,
                 showlegend=True,
-                visible=True  # 默认显示
+                visible=visible
             ))
             
-            print(f"  ✓ 充气法3D网格已添加 (红色半透明)")
+            print(f"  ✓ 充气法3D网格已添加 ({color}, opacity={opacity})")
             print(f"    范围: X[{new_verts[:,0].min():.1f},{new_verts[:,0].max():.1f}], "
                   f"Y[{new_verts[:,1].min():.1f},{new_verts[:,1].max():.1f}], "
                   f"Z[{new_verts[:,2].min():.1f},{new_verts[:,2].max():.1f}]mm")
@@ -2128,8 +2148,36 @@ class DicomTrachea3DPipeline:
         # 创建图形
         fig = go.Figure()
         
-        # 1. 添加3D网格
-        if self.vertices is not None and self.faces is not None:
+        # 若启用3D分析，先提取气管体积（供网格/轮廓分析/中心线使用）
+        selected_3d_labels = {}
+        if use_3d_analysis:
+            if use_flood_fill:
+                selected_3d_labels = self._extract_trachea_3d_flood_fill(
+                    start_z_physical=start_z,
+                    start_z_idx=start_idx
+                )
+                print(f"\n使用3D充气法分析结果 (共{len(selected_3d_labels)}个切片)")
+            else:
+                selected_3d_labels = self._extract_trachea_3d_volume(
+                    start_z_physical=start_z,
+                    start_z_idx=start_idx
+                )
+                print(f"\n使用传统传播法分析结果 (共{len(selected_3d_labels)}个切片)")
+
+        # 1) 3D网格：优先显示“气管掩码”网格（3D分析开启时）
+        used_mask_mesh = False
+        if use_3d_analysis and hasattr(self, 'trachea_mask_3d') and self.trachea_mask_3d is not None:
+            self._add_flood_fill_mesh_to_figure(
+                fig,
+                color='green',
+                opacity=0.65,
+                name='气管区域(3D充气法)',
+                visible=True
+            )
+            used_mask_mesh = True
+
+        # 1) 备用：强度等值面网格（用于对照；当未启用3D分析或掩码缺失时）
+        if (not used_mask_mesh) and self.vertices is not None and self.faces is not None:
             verts = self.vertices.copy()
             
             # 重新排列坐标轴: 原来的(Z,Y,X) -> 新的(X,Y,Z)
@@ -2184,35 +2232,26 @@ class DicomTrachea3DPipeline:
                   f"Y[{verts[:,1].min():.1f},{verts[:,1].max():.1f}], "
                   f"Z[{verts[:,2].min():.1f},{verts[:,2].max():.1f}]mm")
         
-        # 2. (中心线功能已删除)
+        # 2) 中心线（若3D分析已提取）
+        if hasattr(self, 'centerline_world') and self.centerline_world is not None and len(self.centerline_world) > 1:
+            cl = self.centerline_world
+            fig.add_trace(go.Scatter3d(
+                x=cl[:, 0],
+                y=cl[:, 1],
+                z=cl[:, 2],
+                mode='lines+markers',
+                line=dict(color='yellow', width=6),
+                marker=dict(size=3, color='yellow'),
+                name='中心线',
+                showlegend=True
+            ))
+            print(f"✓ 中心线已添加到3D图: {len(cl)}点")
         
         # 3. 添加横截面切片 (对所有切片生成分析)
         if show_cross_sections and self.volume is not None:
             num_slices = self.volume.shape[0]
             
             print(f"\n生成所有切片的横截面分析 (共{num_slices}个切片)...")
-            
-            # 如果启用3D分析,先提取气管体积
-            selected_3d_labels = {}
-            if use_3d_analysis:
-                if use_flood_fill:
-                    # 使用3D连通性分析（充气法）- 更可靠
-                    selected_3d_labels = self._extract_trachea_3d_flood_fill(
-                        start_z_physical=start_z, 
-                        start_z_idx=start_idx
-                    )
-                    print(f"\n使用3D充气法分析结果 (共{len(selected_3d_labels)}个切片)")
-                    
-                    # ⭐ 在3D模型上可视化充气法选中的区域
-                    if hasattr(self, 'trachea_mask_3d') and self.trachea_mask_3d is not None:
-                        self._add_flood_fill_mesh_to_figure(fig)
-                else:
-                    # 使用传统传播法
-                    selected_3d_labels = self._extract_trachea_3d_volume(
-                        start_z_physical=start_z, 
-                        start_z_idx=start_idx
-                    )
-                    print(f"\n使用传统传播法分析结果 (共{len(selected_3d_labels)}个切片)")
             
             # 对所有切片生成分析
             slice_positions = list(range(0, num_slices))
@@ -2927,6 +2966,10 @@ class DicomTrachea3DPipeline:
             analysis_html = self._generate_analysis_html()
             # 在</body>前插入分析内容
             html_content = html_content.replace('</body>', analysis_html + '</body>')
+
+        # 在HTML最底部添加实验信息（参数/耗时/简介）
+        meta_html = self._generate_experiment_meta_html(ended_at=datetime.datetime.now())
+        html_content = html_content.replace('</body>', meta_html + '</body>')
         
         with open(output_html, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -3154,7 +3197,7 @@ class DicomTrachea3DPipeline:
             
             step_names = {
                 'original': '1. 原始切片',
-                'binary': '2. 二值化(40%分位)',
+                'binary': f'2. 二值化({self.percentile:g}%分位)',
                 'morphology': '3. 形态学操作',
                 'connected_components': '4. 连通域标记',
                 'merge_3d': '4.5 同切面3D合并',
@@ -3178,6 +3221,63 @@ class DicomTrachea3DPipeline:
         
         html += '</div>'
         return html
+
+    def _generate_experiment_meta_html(self, *, ended_at: datetime.datetime):
+        """在页面底部展示本次实验参数/耗时/简介。"""
+        started_at = self.experiment_started_at
+        if isinstance(started_at, datetime.datetime):
+            duration_s = (ended_at - started_at).total_seconds()
+            started_str = started_at.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            duration_s = 0.0
+            started_str = "N/A"
+        ended_str = ended_at.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 仅保留可JSON化的参数
+        safe_args = {}
+        for k, v in (self.experiment_args or {}).items():
+            try:
+                json.dumps(v, ensure_ascii=False)
+                safe_args[k] = v
+            except Exception:
+                safe_args[k] = str(v)
+
+        # 补充关键内部参数，方便复现实验
+        safe_args["_internal"] = {
+            "percentile": self.percentile,
+            "roi_size": self.roi_size,
+            "kernel_size": list(self.kernel_size) if isinstance(self.kernel_size, tuple) else self.kernel_size,
+            "2d_morph": "dilate(iter=1)",
+            "3d_closing_iterations": self.closing_iters,
+            "3d_erosion_iterations": self.erosion_iters,
+        }
+
+        intro = (self.experiment_intro or "").strip()
+        intro_html = (
+            intro.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
+        )
+
+        args_pretty = json.dumps(safe_args, ensure_ascii=False, indent=2)
+
+        return f"""
+        <div style="margin-top: 40px; padding: 20px; background: #0b1220; color: #e5e7eb; border-top: 3px solid #2563eb; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">
+            <h2 style="margin: 0 0 10px; font-family: system-ui, -apple-system, sans-serif; color: #fff;">🧪 实验信息</h2>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; font-family: system-ui, -apple-system, sans-serif;">
+                <div><b>开始时间</b>: {started_str}</div>
+                <div><b>结束时间</b>: {ended_str}</div>
+                <div><b>耗时</b>: {duration_s:.2f} s</div>
+                <div><b>输出前缀</b>: {self.output_name}</div>
+            </div>
+
+            <h3 style="margin: 14px 0 8px; font-family: system-ui, -apple-system, sans-serif; color:#fff;">简介（运行前命令行填写）</h3>
+            <pre style="white-space: pre-wrap; background:#111827; padding:12px; border-radius:8px; margin:0 0 14px;">{intro_html if intro_html else "(空)"}</pre>
+
+            <h3 style="margin: 14px 0 8px; font-family: system-ui, -apple-system, sans-serif; color:#fff;">参数（命令行 + 内部关键参数）</h3>
+            <pre style="white-space: pre-wrap; background:#111827; padding:12px; border-radius:8px; margin:0;">{args_pretty}</pre>
+        </div>
+        """
     
     def run_full_pipeline(self, z_min=None, z_max=None, downsample_size=256,
                          iso_value=0.5, step_size=2, output_html=None,
@@ -3270,6 +3370,14 @@ def main():
                        help='Marching Cubes等值面(默认: 0.5)')
     parser.add_argument('--step', type=int, default=2,
                        help='Marching Cubes步长(默认: 2)')
+    parser.add_argument('--percentile', type=float, default=36.5,
+                       help='二值化分位阈值(默认: 36.5；越小越保守，越不易粘连；支持小数如35.5)')
+    parser.add_argument('--closing-iters', type=int, default=2,
+                       help='3D closing 迭代次数(默认: 2)')
+    parser.add_argument('--erosion-iters', type=int, default=1,
+                       help='3D erosion 迭代次数(默认: 1；可设0表示不做erosion)')
+    parser.add_argument('--intro', type=str, default="",
+                       help='本次实验简介（用于记录思路/目的，写入HTML底部）')
     parser.add_argument('--z-min', type=float, help='Z轴最小值(mm)')
     parser.add_argument('--z-max', type=float, help='Z轴最大值(mm)')
     parser.add_argument('--no-cross-sections', action='store_true',
@@ -3315,7 +3423,16 @@ def main():
     output_html = os.path.join(output_dir, f"{args.output}_3d_{ts}.html")
     
     # 创建流程对象
-    pipeline = DicomTrachea3DPipeline(args.dicom, args.output)
+    pipeline = DicomTrachea3DPipeline(
+        args.dicom,
+        args.output,
+        percentile=args.percentile,
+        closing_iters=args.closing_iters,
+        erosion_iters=args.erosion_iters,
+    )
+    pipeline.experiment_intro = args.intro or ""
+    pipeline.experiment_args = vars(args).copy()
+    pipeline.experiment_started_at = datetime.datetime.now()
     
     # 运行完整流程
     success = pipeline.run_full_pipeline(
