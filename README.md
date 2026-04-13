@@ -2,54 +2,40 @@
 
 一个基于Xilinx KV260平台的端到端医学图像处理流水线系统，集成了数据预处理、AI分割和三维重建功能。
 
-## 🚀 快速开始 - 5分钟看到效果！
+## 🚀 快速开始（Windows）
 
-### ⭐ 推荐：使用虚拟环境（最佳实践）
+当前仓库推荐用 `dicom_trachea_complete.py` 直接从 DICOM 生成交互式 3D HTML 结果（包含横截面切片分析面板）。
+
+### 1) 安装依赖
 
 ```bash
-# 1. 创建并配置虚拟环境（仅首次，自动安装所有依赖）
-.\setup_env.bat
-
-# 2. 运行增强版可视化（中心线+虚拟内窥镜）
-.\run_enhanced_viz.bat
-
-# 或者手动运行
-.\.venv\Scripts\python.exe enhanced_visualizer.py marching_cubes_c\out.vtk --npy marching_cubes_c\case_00000_x.npy --endoscopy
+pip install -r requirements.txt
 ```
 
-📖 **虚拟环境详细说明**: [VIRTUAL_ENV_GUIDE.md](VIRTUAL_ENV_GUIDE.md)
+### 2) 运行（默认：启用横截面面板、默认充气法、运行结束不自动打开浏览器）
 
----
-
-### 方法1: 一键运行批处理脚本
 ```bash
-# Windows用户直接双击运行
-run_full_demo.bat
-
-# 或者使用命令行
-.\run_full_demo.bat
+python dicom_trachea_complete.py --dicom .\dicom1 --no-open
 ```
 
-### 方法2: Jupyter Notebook交互式演示
+输出会生成到 `output/`，文件名自动带时间戳（`MMDD_HHMM`），例如：
+
+- `output\trachea_reconstruction_3d_0413_1859.html`
+
+### 3) 推荐：启用 3D 分析（充气法）提升“气管区域”提取正确性
+
 ```bash
-# 使用虚拟环境
-.\.venv\Scripts\jupyter.exe notebook Quick_Start_Demo.ipynb
-
-# 或全局安装
-pip install jupyter numpy plotly matplotlib
-jupyter notebook Quick_Start_Demo.ipynb
+python dicom_trachea_complete.py --dicom .\dicom1 --use-3d-analysis --no-open
 ```
 
-### 方法3: Python可视化脚本
-```bash
-# 基础可视化
-python quick_demo_viewer.py marching_cubes_c\out.vtk
+常用可选参数：
 
-# 增强版（中心线+虚拟内窥镜）⭐新增
-python enhanced_visualizer.py marching_cubes_c\out.vtk --npy marching_cubes_c\case_00000_x.npy --endoscopy
-```
-
-📖 **详细说明**: 查看 [DEMO_GUIDE.md](DEMO_GUIDE.md) 和 [ENHANCED_VISUALIZER_GUIDE.md](ENHANCED_VISUALIZER_GUIDE.md)
+- `--z-min / --z-max`：裁剪 Z 范围（mm）
+- `--size`：降采样尺寸（默认 256）
+- `--iso`：等值面（默认 0.5）
+- `--step`：Marching Cubes 步长（默认 2；更细可用 1）
+- `--endoscopy`：添加虚拟内窥镜动画
+- `--open`：运行结束后自动打开浏览器（默认关闭）
 
 ---
 
@@ -91,6 +77,10 @@ kv260-medical-image-pipeline/
 │   └── reconstruction/       # 3D重建实验
 └── README.md                 # 项目说明文档
 ```
+
+## 数据文件说明（重要）
+
+为避免仓库体积膨胀，`dicom1/`、`dicom2/` 等 DICOM 数据目录默认 **不提交到 Git**（已在 `.gitignore` 中忽略）。请在本地放置自己的数据集路径后运行脚本。
 
 ## 核心模块
 
