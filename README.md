@@ -4,7 +4,24 @@
 
 ## 🚀 快速开始 - 5分钟看到效果！
 
-### 方法1: 一键运行批处理脚本（最简单）
+### ⭐ 推荐：使用虚拟环境（最佳实践）
+
+```bash
+# 1. 创建并配置虚拟环境（仅首次，自动安装所有依赖）
+.\setup_env.bat
+
+# 2. 运行增强版可视化（中心线+虚拟内窥镜）
+.\run_enhanced_viz.bat
+
+# 或者手动运行
+.\.venv\Scripts\python.exe enhanced_visualizer.py marching_cubes_c\out.vtk --npy marching_cubes_c\case_00000_x.npy --endoscopy
+```
+
+📖 **虚拟环境详细说明**: [VIRTUAL_ENV_GUIDE.md](VIRTUAL_ENV_GUIDE.md)
+
+---
+
+### 方法1: 一键运行批处理脚本
 ```bash
 # Windows用户直接双击运行
 run_full_demo.bat
@@ -13,26 +30,26 @@ run_full_demo.bat
 .\run_full_demo.bat
 ```
 
-### 方法2: Jupyter Notebook交互式演示（推荐）
+### 方法2: Jupyter Notebook交互式演示
 ```bash
-# 安装Jupyter
-pip install jupyter numpy plotly matplotlib
+# 使用虚拟环境
+.\.venv\Scripts\jupyter.exe notebook Quick_Start_Demo.ipynb
 
-# 启动notebook
+# 或全局安装
+pip install jupyter numpy plotly matplotlib
 jupyter notebook Quick_Start_Demo.ipynb
 ```
 
 ### 方法3: Python可视化脚本
 ```bash
-# 先生成VTK文件（如果还没有）
-cd marching_cubes_c
-# ... 编译和运行 ...
+# 基础可视化
+python quick_demo_viewer.py marching_cubes_c\out.vtk
 
-# 然后可视化
-python quick_demo_viewer.py marching_cubes_c/out.vtk
+# 增强版（中心线+虚拟内窥镜）⭐新增
+python enhanced_visualizer.py marching_cubes_c\out.vtk --npy marching_cubes_c\case_00000_x.npy --endoscopy
 ```
 
-📖 **详细说明**: 查看 [quick_demo.md](quick_demo.md)
+📖 **详细说明**: 查看 [DEMO_GUIDE.md](DEMO_GUIDE.md) 和 [ENHANCED_VISUALIZER_GUIDE.md](ENHANCED_VISUALIZER_GUIDE.md)
 
 ---
 
