@@ -59,6 +59,7 @@ class DicomTrachea3DPipeline:
         percentile=36.5,
         closing_iters=2,
         erosion_iters=1,
+        fixed_threshold=None,
     ):
         self.dicom_dir = dicom_dir
         self.output_name = output_name
@@ -71,6 +72,8 @@ class DicomTrachea3DPipeline:
         self.kernel_size = (3, 3)   # 形态学核
         self.closing_iters = int(closing_iters)
         self.erosion_iters = int(erosion_iters)
+        # 固定阈值（用于3D充气法二值化）。取值建议为窗位窗宽归一化后的[0,1]。
+        self.fixed_threshold = None if fixed_threshold is None else float(fixed_threshold)
         
         # 数据
         self.slices_data = []       # [(z_pos, ds, pixel_array), ...]
@@ -93,18 +96,20 @@ class DicomTrachea3DPipeline:
         
         # 查找DICOM文件
         dicom_files = []
+        dicom_root = Path(self.dicom_dir)
         for ext in ['*.dcm', '*.DCM', '*.dicom', '*.DICOM']:
-            dicom_files.extend(glob.glob(os.path.join(self.dicom_dir, ext)))
+            dicom_files.extend(str(p) for p in dicom_root.rglob(ext) if p.is_file())
         
         if not dicom_files:
-            all_files = glob.glob(os.path.join(self.dicom_dir, '*'))
-            for f in all_files:
-                if os.path.isfile(f):
-                    try:
-                        pydicom.dcmread(f, stop_before_pixels=True)
-                        dicom_files.append(f)
-                    except:
-                        pass
+            # 兼容无扩展名/嵌套目录（例如 dicom2/SE5/IM0）
+            for p in dicom_root.rglob('*'):
+                if not p.is_file():
+                    continue
+                try:
+                    pydicom.dcmread(str(p), stop_before_pixels=True)
+                    dicom_files.append(str(p))
+                except Exception:
+                    pass
         
         print(f"找到 {len(dicom_files)} 个DICOM文件")
         
@@ -200,10 +205,18 @@ class DicomTrachea3DPipeline:
             plt.close()
         
         # 2. 阈值二值化 (⭐ 只在ROI上操作)
+        # 与3D充气法保持一致：fixed-threshold 模式使用窗位窗宽归一化后的[0,1]阈值；否则使用分位阈值
         non_bg = roi[roi > 0.1]
         if len(non_bg) >= 100:
-            threshold = np.percentile(non_bg, self.percentile)
-            binary = ((roi > 0.1) & (roi < threshold)).astype(np.uint8)
+            if self.fixed_threshold is not None:
+                threshold = float(self.fixed_threshold)
+                roi_windowed = roi  # slice_data 已是[0,1]，这里保持兼容命名
+                binary = ((roi > 0.1) & (roi_windowed < threshold)).astype(np.uint8)
+                binary_title = f'二值化 (固定阈值={threshold:g})\n阈值域=[0,1]'
+            else:
+                threshold = np.percentile(non_bg, self.percentile)
+                binary = ((roi > 0.1) & (roi < threshold)).astype(np.uint8)
+                binary_title = f'二值化 ({self.percentile:g}%分位)\nROI内阈值={threshold:.3f}'
             
             # 边缘清零
             binary[0, :] = 0
@@ -213,7 +226,7 @@ class DicomTrachea3DPipeline:
             
             fig, ax = plt.subplots(figsize=(4, 4))
             ax.imshow(binary, cmap='gray')
-            ax.set_title(f'二值化 ({self.percentile}%分位)\nROI内阈值={threshold:.3f}', fontsize=10)
+            ax.set_title(binary_title, fontsize=10)
             ax.axis('off')
             
             buf = BytesIO()
@@ -1314,16 +1327,28 @@ class DicomTrachea3DPipeline:
             # 提取ROI
             roi = hu_image[y1:y2, x1:x2]
             
-            # 二值化（分位阈值 - 只选择最黑的气管区域）
+            # 二值化：
+            # - 默认：分位阈值（只选择最黑的气管区域）
+            # - 可选：固定阈值（窗位窗宽归一化后的[0,1]阈值）
             non_bg = roi[roi > -1900]
             if len(non_bg) < 100:
                 slice_thresholds.append(None)
                 continue
             
-            threshold = np.percentile(non_bg, self.percentile)
-            slice_thresholds.append(threshold)
-            
-            binary = ((roi > -1900) & (roi < threshold)).astype(np.uint8)
+            if self.fixed_threshold is not None:
+                # 与 step3_generate_mesh 保持一致的窗位窗宽归一化
+                window_center, window_width = -600, 1500
+                img_min = window_center - window_width / 2
+                img_max = window_center + window_width / 2
+                roi_windowed = np.clip(roi, img_min, img_max)
+                roi_windowed = (roi_windowed - img_min) / (img_max - img_min)  # [0,1]
+                threshold = float(self.fixed_threshold)
+                slice_thresholds.append(threshold)
+                binary = ((roi > -1900) & (roi_windowed < threshold)).astype(np.uint8)
+            else:
+                threshold = np.percentile(non_bg, self.percentile)
+                slice_thresholds.append(threshold)
+                binary = ((roi > -1900) & (roi < threshold)).astype(np.uint8)
             
             # 边缘清零
             binary[0, :] = 0
@@ -1442,6 +1467,10 @@ class DicomTrachea3DPipeline:
                 print("   ✗ 无法找到有效种子点！")
                 return {}
             print(f"   找到种子点: (z={seed_z}, y={seed_y}, x={seed_x})")
+
+        # 记录本次3D分析最终使用的种子切片（供网页初始切片/调试使用）
+        self.seed_z_idx = int(seed_z)
+        self.seed_z_mm = float(self.slices_data[seed_z][0]) if 0 <= seed_z < len(self.slices_data) else None
         
         # 提取气管3D连通域
         trachea_mask_3d = (labeled_3d == seed_label_3d)
@@ -2123,6 +2152,8 @@ class DicomTrachea3DPipeline:
         except Exception as e:
             print(f"✗ Marching Cubes失败: {e}")
             return 0, 0
+
+    # 图层显隐控制：使用 Plotly 自带 legend（单击隐藏/显示，双击独显）
     
     def step4_create_visualization(self, output_html=None,
                                    show_endoscopy=False,
@@ -2164,20 +2195,10 @@ class DicomTrachea3DPipeline:
                 )
                 print(f"\n使用传统传播法分析结果 (共{len(selected_3d_labels)}个切片)")
 
-        # 1) 3D网格：优先显示“气管掩码”网格（3D分析开启时）
-        used_mask_mesh = False
-        if use_3d_analysis and hasattr(self, 'trachea_mask_3d') and self.trachea_mask_3d is not None:
-            self._add_flood_fill_mesh_to_figure(
-                fig,
-                color='green',
-                opacity=0.65,
-                name='气管区域(3D充气法)',
-                visible=True
-            )
-            used_mask_mesh = True
-
-        # 1) 备用：强度等值面网格（用于对照；当未启用3D分析或掩码缺失时）
-        if (not used_mask_mesh) and self.vertices is not None and self.faces is not None:
+        # 1) 其他结构背景（半透明）：强度等值面网格
+        #    目的：在3D画面中提供“解剖/其他结构”的空间参照，气管网格在其上叠加显示。
+        has_main_mesh = (self.vertices is not None and self.faces is not None)
+        if has_main_mesh:
             verts = self.vertices.copy()
             
             # 重新排列坐标轴: 原来的(Z,Y,X) -> 新的(X,Y,Z)
@@ -2200,9 +2221,8 @@ class DicomTrachea3DPipeline:
             
             new_verts[:, 2] = z_physical  # Z = 实际物理坐标(mm)
             verts = new_verts
-            
-            z_values = verts[:, 2]
-            
+
+            # 半透明背景网格（单色，避免过大的颜色映射开销）
             fig.add_trace(go.Mesh3d(
                 x=verts[:, 0],
                 y=verts[:, 1],
@@ -2210,27 +2230,36 @@ class DicomTrachea3DPipeline:
                 i=self.faces[:, 0],
                 j=self.faces[:, 1],
                 k=self.faces[:, 2],
-                intensity=z_values,
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(title="Z坐标 (mm)", x=1.0),
-                opacity=0.7,  # 降低透明度,让内部中心线可见
+                color='#9CA3AF',  # gray-400
+                opacity=0.18,     # 其他结构半透明背景
+                showscale=False,
                 lighting=dict(
-                    ambient=0.6,
-                    diffuse=0.8,
-                    roughness=0.5,
-                    specular=0.3,
-                    fresnel=0.2
+                    ambient=0.9,
+                    diffuse=0.4,
+                    roughness=0.9,
+                    specular=0.05
                 ),
-                lightposition=dict(x=100, y=200, z=300),
-                name='气管网格',
+                name='其他结构(半透明)',
+                showlegend=True,
                 flatshading=False,
                 visible=True
             ))
-            print(f"✓ 添加3D网格: {len(verts):,}个顶点")
+            print(f"✓ 添加背景网格(其他结构): {len(verts):,}个顶点")
             print(f"  网格范围: X[{verts[:,0].min():.1f},{verts[:,0].max():.1f}], "
                   f"Y[{verts[:,1].min():.1f},{verts[:,1].max():.1f}], "
                   f"Z[{verts[:,2].min():.1f},{verts[:,2].max():.1f}]mm")
+
+        # 2) 气管网格（3D分析开启时优先显示掩码网格）
+        used_mask_mesh = False
+        if use_3d_analysis and hasattr(self, 'trachea_mask_3d') and self.trachea_mask_3d is not None:
+            self._add_flood_fill_mesh_to_figure(
+                fig,
+                color='green',
+                opacity=0.65,
+                name='气管区域(3D充气法)',
+                visible=True
+            )
+            used_mask_mesh = True
         
         # 2) 中心线（若3D分析已提取）
         if hasattr(self, 'centerline_world') and self.centerline_world is not None and len(self.centerline_world) > 1:
@@ -2253,10 +2282,22 @@ class DicomTrachea3DPipeline:
             
             print(f"\n生成所有切片的横截面分析 (共{num_slices}个切片)...")
             
-            # 对所有切片生成分析
-            slice_positions = list(range(0, num_slices))
+            # 按间隔抽样生成分析（避免把全部切片都塞进HTML导致体积/内存暴涨）
+            interval = int(cross_section_interval) if cross_section_interval and cross_section_interval > 0 else 1
+            slice_positions = list(range(0, num_slices, interval))
+            if (num_slices - 1) not in slice_positions:
+                slice_positions.append(num_slices - 1)
+
+            # 确保种子切片一定会被生成（否则“初始选中切片=种子切片”无法满足）
+            seed_z_idx = getattr(self, "seed_z_idx", None)
+            if seed_z_idx is not None and 0 <= int(seed_z_idx) < num_slices and int(seed_z_idx) not in slice_positions:
+                slice_positions.append(int(seed_z_idx))
+                slice_positions.sort()
             
-            print(f"  将分析所有切片: Z=0 到 Z={num_slices-1}")
+            if interval == 1:
+                print(f"  将分析所有切片: Z=0 到 Z={num_slices-1}")
+            else:
+                print(f"  将按间隔分析切片: interval={interval} (共{len(slice_positions)}张)")
             
             added_count = 0
             self.cross_section_analysis = []  # 清空之前的分析
@@ -2683,7 +2724,7 @@ class DicomTrachea3DPipeline:
                     scale_factor = self.downsample_size / self.original_size[0]
                     points_scaled = points_global * scale_factor
                     
-                    if z_idx == 30:
+                    if z_idx == 30 and points_scaled is not None and len(points_scaled) > 0:
                         print(f"    第1个轮廓点 - 缩放: ({points_scaled[0, 0]:.1f}, {points_scaled[0, 1]:.1f})")
                         cx_scaled_contour = (cx_contour + x1) * scale_factor
                         cy_scaled_contour = (cy_contour + y1) * scale_factor
@@ -2807,7 +2848,13 @@ class DicomTrachea3DPipeline:
                         print(f"    🔍 3D轮廓坐标（步骤7黄色轮廓）: Z_idx={z_idx}, Z_physical={z_physical:.1f}mm")
                         print(f"       步骤7轮廓点: {len(contour_points_roi)}个点")
                         print(f"       ROI偏移: ({roi_x1}, {roi_y1})")
-                        print(f"       X范围[{x_coords.min():.1f}, {x_coords.max():.1f}], Y范围[{y_coords.min():.1f}, {y_coords.max():.1f}]")
+                        if x_coords.size > 0 and y_coords.size > 0:
+                            print(
+                                f"       X范围[{x_coords.min():.1f}, {x_coords.max():.1f}], "
+                                f"Y范围[{y_coords.min():.1f}, {y_coords.max():.1f}]"
+                            )
+                        else:
+                            print("       X/Y范围: (空轮廓)")
                     
                     # 1. 添加CT图像平面（半透明，类似参考平面）
                     if z_idx < self.volume.shape[0]:
@@ -2993,8 +3040,12 @@ class DicomTrachea3DPipeline:
                 'area': int(s['area'])
             })
         
-        # 选择初始切片：优先30，否则中间
-        initial_z_idx = 30 if any(s['z_idx'] == 30 for s in slice_list) else slice_list[len(slice_list)//2]['z_idx']
+        # 选择初始切片：优先“种子切片”，否则30，否则中间
+        seed_z_idx = getattr(self, "seed_z_idx", None)
+        if seed_z_idx is not None and any(s['z_idx'] == int(seed_z_idx) for s in slice_list):
+            initial_z_idx = int(seed_z_idx)
+        else:
+            initial_z_idx = 30 if any(s['z_idx'] == 30 for s in slice_list) else slice_list[len(slice_list)//2]['z_idx']
         self.initial_display_z = initial_z_idx  # 保存供trace使用
         
         # 找到初始切片的数组索引
@@ -3147,12 +3198,18 @@ class DicomTrachea3DPipeline:
         
         # 添加横截面分析部分
         if hasattr(self, 'cross_section_analysis') and len(self.cross_section_analysis) > 0:
+            if self.fixed_threshold is not None:
+                threshold_desc = (
+                    f"固定阈值：{self.fixed_threshold:g}（窗位窗宽归一化[0,1]；WC=-600, WW=1500）"
+                )
+            else:
+                threshold_desc = f"分位阈值：{self.percentile:g}% 分位（每切片自适应）"
             html += """
             <div style="margin: 30px 0;">
                 <h2 style="color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px;">
                     🔍 横截面轮廓分析
                 </h2>
-                <p style="color: #666;">气管横截面的完整轮廓提取过程</p>
+                <p style="color: #666;">气管横截面的完整轮廓提取过程（当前二值化策略：""" + threshold_desc + """）</p>
             </div>
             """
         
@@ -3195,9 +3252,14 @@ class DicomTrachea3DPipeline:
             # 显示处理步骤图像
             html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 15px;">'
             
+            if self.fixed_threshold is not None:
+                binary_title = f'2. 二值化(固定阈值={self.fixed_threshold:g})'
+            else:
+                binary_title = f'2. 二值化({self.percentile:g}%分位)'
+
             step_names = {
                 'original': '1. 原始切片',
-                'binary': f'2. 二值化({self.percentile:g}%分位)',
+                'binary': binary_title,
                 'morphology': '3. 形态学操作',
                 'connected_components': '4. 连通域标记',
                 'merge_3d': '4.5 同切面3D合并',
@@ -3344,20 +3406,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
-  # 基本使用(推荐)
-  python dicom_trachea_complete.py --dicom dicom文件夹
+  # 基本使用(必填: Z范围 + 种子)
+  python dicom_trachea_complete.py --dicom dicom文件夹 --z-min -119 --z-max -44 --start-z -100
   
   # 只重建主气管区域(Z=-119到-44mm)
-  python dicom_trachea_complete.py --dicom dicom文件夹 --z-min -119 --z-max -44
+  python dicom_trachea_complete.py --dicom dicom文件夹 --z-min -119 --z-max -44 --start-z -100
   
   # 添加虚拟内窥镜动画
-  python dicom_trachea_complete.py --dicom dicom文件夹 --endoscopy
+  python dicom_trachea_complete.py --dicom dicom文件夹 --z-min -119 --z-max -44 --start-z -100 --endoscopy
   
   # 高质量重建
-  python dicom_trachea_complete.py --dicom dicom文件夹 --size 256 --step 1
+  python dicom_trachea_complete.py --dicom dicom文件夹 --z-min -119 --z-max -44 --start-z -100 --size 256 --step 1
   
   # 自定义输出
-  python dicom_trachea_complete.py --dicom dicom文件夹 --output my_trachea
+  python dicom_trachea_complete.py --dicom dicom文件夹 --z-min -119 --z-max -44 --start-z -100 --output my_trachea
         """
     )
     
@@ -3372,14 +3434,16 @@ def main():
                        help='Marching Cubes步长(默认: 2)')
     parser.add_argument('--percentile', type=float, default=36.5,
                        help='二值化分位阈值(默认: 36.5；越小越保守，越不易粘连；支持小数如35.5)')
+    parser.add_argument('--fixed-threshold', type=float, default=None,
+                       help='固定二值化阈值（窗位窗宽归一化后的[0,1]阈值）。设置后将覆盖 --percentile 的分位阈值策略。')
     parser.add_argument('--closing-iters', type=int, default=2,
                        help='3D closing 迭代次数(默认: 2)')
     parser.add_argument('--erosion-iters', type=int, default=1,
                        help='3D erosion 迭代次数(默认: 1；可设0表示不做erosion)')
     parser.add_argument('--intro', type=str, default="",
                        help='本次实验简介（用于记录思路/目的，写入HTML底部）')
-    parser.add_argument('--z-min', type=float, help='Z轴最小值(mm)')
-    parser.add_argument('--z-max', type=float, help='Z轴最大值(mm)')
+    parser.add_argument('--z-min', type=float, required=True, help='Z轴最小值(mm)【必填】')
+    parser.add_argument('--z-max', type=float, required=True, help='Z轴最大值(mm)【必填】')
     parser.add_argument('--no-cross-sections', action='store_true',
                        help='不显示横截面切片')
     parser.add_argument('--section-interval', type=int, default=15,
@@ -3394,10 +3458,11 @@ def main():
                        help='使用3D分析(推荐启用)')
     parser.add_argument('--use-propagation', action='store_true',
                        help='使用传统传播法而非充气法(默认使用充气法)')
-    parser.add_argument('--start-z', type=float, default=-100.0,
-                       help='3D分析起始Z坐标(mm,默认: -100.0)')
-    parser.add_argument('--start-idx', type=int, default=None,
-                       help='3D分析起始z_idx(优先于--start-z,默认: None)')
+    seed_group = parser.add_mutually_exclusive_group(required=True)
+    seed_group.add_argument('--start-z', type=float, default=None,
+                            help='3D分析起始Z坐标(mm)【必填二选一: --start-z 或 --start-idx】')
+    seed_group.add_argument('--start-idx', type=int, default=None,
+                            help='3D分析起始z_idx【必填二选一: --start-z 或 --start-idx】')
     
     args = parser.parse_args()
     
@@ -3429,6 +3494,7 @@ def main():
         percentile=args.percentile,
         closing_iters=args.closing_iters,
         erosion_iters=args.erosion_iters,
+        fixed_threshold=args.fixed_threshold,
     )
     pipeline.experiment_intro = args.intro or ""
     pipeline.experiment_args = vars(args).copy()

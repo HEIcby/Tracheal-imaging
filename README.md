@@ -6,34 +6,56 @@
 
 当前仓库推荐用 `dicom_trachea_complete.py` 直接从 DICOM 生成交互式 3D HTML 结果（包含横截面切片分析面板）。
 
+推荐参数（按样本维护）见：`dev_logs/recommended_params.md`。
+
 ### 1) 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2) 运行（默认：启用横截面面板、默认充气法、运行结束不自动打开浏览器）
+### 2) 运行（必填：Z 范围 + 种子；默认：启用横截面面板、默认充气法、运行结束不自动打开浏览器）
 
 ```bash
-python dicom_trachea_complete.py --dicom .\dicom1 --no-open
+python dicom_trachea_complete.py --dicom .\dicom1 --z-min -100 --z-max 50 --start-z -89 --use-3d-analysis --fixed-threshold 0.33 --section-interval 2 --no-open
 ```
 
 输出会生成到 `output/`，文件名自动带时间戳（`MMDD_HHMM`），例如：
 
 - `output\trachea_reconstruction_3d_0413_1859.html`
 
-### 3) 推荐：启用 3D 分析（充气法）提升“气管区域”提取正确性
+打开 HTML 后：
+
+- 3D 视图中会显示三层：**其他结构(半透明)** / **气管区域(3D充气法)** / **中心线**
+- 使用 Plotly **图例（legend）** 进行开关：单击隐藏/显示，双击独显（默认三层都显示）
+
+### 3) 关于 Z 范围与种子（重要）
+
+`--z-min/--z-max` 与种子（`--start-z` 或 `--start-idx`）现在是**必填参数**，没有默认值。
+
+- 建议先把 Z 范围裁剪到“包含完整气管段”的区间，再在区间中部选择一个“气管特征明显”的切片作为种子
+- 选择不要求特别精确，后续可在用户交互环节做成更直观的选择方式
+
+### 4) 推荐：启用 3D 分析（充气法）提升“气管区域”提取正确性
 
 ```bash
-python dicom_trachea_complete.py --dicom .\dicom1 --use-3d-analysis --no-open
+python dicom_trachea_complete.py --dicom .\dicom1 --z-min -100 --z-max 50 --start-z -89 --use-3d-analysis --fixed-threshold 0.33 --section-interval 2 --no-open
+```
+
+如果你只想先验证 3D 主流程稳定输出（不生成横截面面板），可用：
+
+```bash
+python dicom_trachea_complete.py --dicom .\dicom1 --z-min -100 --z-max 50 --start-z -89 --use-3d-analysis --fixed-threshold 0.33 --no-cross-sections --no-open
 ```
 
 常用可选参数：
 
-- `--z-min / --z-max`：裁剪 Z 范围（mm）
+- `--z-min / --z-max`：裁剪 Z 范围（mm）【必填】
+- `--start-z / --start-idx`：3D 分析种子（mm / index）【必填二选一】
 - `--size`：降采样尺寸（默认 256）
 - `--iso`：等值面（默认 0.5）
 - `--step`：Marching Cubes 步长（默认 2；更细可用 1）
+- `--fixed-threshold`：固定二值化阈值（窗位窗宽归一化后的 \([0,1]\)；设置后覆盖 `--percentile` 的分位阈值策略）
 - `--endoscopy`：添加虚拟内窥镜动画
 - `--open`：运行结束后自动打开浏览器（默认关闭）
 
