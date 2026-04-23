@@ -87,6 +87,353 @@ class DicomTrachea3DPipeline:
         self.experiment_intro = ""
         self.experiment_args = {}
         self.experiment_started_at = None  # datetime.datetime
+        # 导航线（从3D掩码计算；用于插管路径/相机漫游）
+        self.navigation_path_plotly = None  # (N,3): x_ds, y_ds, z_mm
+        self.navigation_path_voxel = None   # (N,3): z_idx, y_roi, x_roi（ROI原始分辨率）
+        self.navigation_meta = {}
+
+    def _estimate_spacing_mm(self):
+        """估计体素间距（mm）。X/Y来自PixelSpacing，Z用切片物理Z的中位差。"""
+        if not self.slices_data:
+            return 1.0, 1.0, 1.0
+
+        ds0 = self.slices_data[0][1]
+        row_mm, col_mm = 1.0, 1.0
+        try:
+            if hasattr(ds0, "PixelSpacing") and len(ds0.PixelSpacing) >= 2:
+                row_mm = float(ds0.PixelSpacing[0])
+                col_mm = float(ds0.PixelSpacing[1])
+        except Exception:
+            pass
+
+        z_positions = [float(z) for z, _, _ in self.slices_data]
+        if len(z_positions) >= 2:
+            dzs = np.abs(np.diff(np.array(z_positions, dtype=np.float64)))
+            dz_mm = float(np.median(dzs)) if np.any(dzs > 0) else 1.0
+        else:
+            dz_mm = 1.0
+
+        return dz_mm, row_mm, col_mm
+
+    def _polyline_min_turn_radius_mm(self, pts_mm: np.ndarray):
+        """返回折线的最小转弯半径(mm)。三点外接圆半径作为离散曲率近似。"""
+        if pts_mm is None or len(pts_mm) < 3:
+            return float("inf")
+        p = pts_mm.astype(np.float64)
+        min_r = float("inf")
+        for i in range(1, len(p) - 1):
+            a = p[i - 1]
+            b = p[i]
+            c = p[i + 1]
+            ab = b - a
+            bc = c - b
+            ac = c - a
+            lab = np.linalg.norm(ab)
+            lbc = np.linalg.norm(bc)
+            lac = np.linalg.norm(ac)
+            if lab < 1e-6 or lbc < 1e-6 or lac < 1e-6:
+                continue
+            # 三角形面积 = 0.5*|ab x ac|
+            area2 = np.linalg.norm(np.cross(ab, ac))
+            if area2 < 1e-9:
+                continue
+            r = (lab * lbc * lac) / (area2 + 1e-12)
+            if r < min_r:
+                min_r = r
+        return min_r
+
+    def _resample_polyline_by_step(self, pts_mm: np.ndarray, step_mm: float):
+        """按弧长步长重采样折线（线性插值）。"""
+        if pts_mm is None or len(pts_mm) < 2:
+            return pts_mm
+        p = pts_mm.astype(np.float64)
+        seg = np.linalg.norm(np.diff(p, axis=0), axis=1)
+        total = float(np.sum(seg))
+        if total <= 1e-6:
+            return p
+        step_mm = max(0.5, float(step_mm))
+        n = max(2, int(np.floor(total / step_mm)) + 1)
+        t = np.concatenate([[0.0], np.cumsum(seg)])
+        t_new = np.linspace(0.0, t[-1], n)
+        out = np.zeros((n, 3), dtype=np.float64)
+        j = 0
+        for i, ti in enumerate(t_new):
+            while j < len(t) - 2 and ti > t[j + 1]:
+                j += 1
+            t0, t1 = t[j], t[j + 1]
+            if t1 <= t0 + 1e-9:
+                out[i] = p[j]
+            else:
+                alpha = (ti - t0) / (t1 - t0)
+                out[i] = (1 - alpha) * p[j] + alpha * p[j + 1]
+        return out
+
+    def _find_nearest_skeleton_voxel(self, target_zyx, skel: np.ndarray, max_radius=25):
+        """在骨架体素中找离target最近的点（逐步扩张立方邻域；避免全局DT的大内存）。"""
+        tz, ty, tx = (int(target_zyx[0]), int(target_zyx[1]), int(target_zyx[2]))
+        z_max, y_max, x_max = skel.shape
+        if 0 <= tz < z_max and 0 <= ty < y_max and 0 <= tx < x_max and skel[tz, ty, tx]:
+            return (tz, ty, tx)
+        for r in range(1, int(max_radius) + 1):
+            z0, z1 = max(0, tz - r), min(z_max - 1, tz + r)
+            y0, y1 = max(0, ty - r), min(y_max - 1, ty + r)
+            x0, x1 = max(0, tx - r), min(x_max - 1, tx + r)
+            window = skel[z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
+            if not np.any(window):
+                continue
+            coords = np.argwhere(window)
+            coords[:, 0] += z0
+            coords[:, 1] += y0
+            coords[:, 2] += x0
+            d2 = np.sum((coords - np.array([tz, ty, tx], dtype=np.int32)) ** 2, axis=1)
+            best = coords[int(np.argmin(d2))]
+            return (int(best[0]), int(best[1]), int(best[2]))
+        return None
+
+    def _compute_navigation_path_from_mask(
+        self,
+        *,
+        min_turn_radius_mm: float = 12.0,
+        resample_step_mm: float = 1.0,
+        wall_bias_power: float = 1.5,
+        max_smoothing_iters: int = 6,
+    ):
+        """
+        从3D二值掩码计算“管腔中心导航线”。
+        - 仅使用体素图 + 几何代价（不参考2D中心线点列）
+        - 在掩码内部偏好“远离壁”的路径：基于距离变换的代价
+        输出：
+          - self.navigation_path_voxel: (N,3) z_idx,y_roi,x_roi（ROI原始分辨率）
+          - self.navigation_path_plotly: (N,3) x_ds,y_ds,z_mm（与HTML一致坐标系）
+        """
+        if self.trachea_mask_3d is None or self.slices_data is None or len(self.slices_data) == 0:
+            return False
+
+        mask = (self.trachea_mask_3d > 0)
+        if mask.ndim != 3 or np.sum(mask) < 50:
+            return False
+
+        dz_mm, dy_mm, dx_mm = self._estimate_spacing_mm()
+
+        # 距离变换（mm）：在掩码内部，离壁越远值越大
+        from scipy.ndimage import distance_transform_edt
+        dist_mm = distance_transform_edt(mask, sampling=(dz_mm, dy_mm, dx_mm)).astype(np.float32)
+
+        # 骨架（细化）作为可搜索的中心候选集
+        print("\n计算导航线：3D骨架化 + 路径搜索...")
+        try:
+            # scikit-image < 0.20
+            from skimage.morphology import skeletonize_3d as _skel3d  # type: ignore
+            skel = _skel3d(mask).astype(bool)
+        except Exception:
+            try:
+                # scikit-image >= 0.20：skeletonize 支持 nD（含 3D）
+                from skimage.morphology import skeletonize
+                skel = skeletonize(mask.astype(bool)).astype(bool)
+            except Exception as e:
+                print(f"  ✗ 3D骨架化不可用: {e}")
+                return False
+        skel_count = int(np.sum(skel))
+        print(f"  骨架体素: {skel_count:,}")
+        if skel_count < 50:
+            print("  ✗ 骨架体素过少，跳过导航线")
+            return False
+
+        # 起终点：沿堆叠方向，从“物理Z较大端(zmax/头侧)”与“物理Z较小端(zmin/足侧)”
+        # 各自向内找到第一个仍有掩码的切片（充气结果常在两端若干层为空，不能硬用0/N-1）
+        zN = mask.shape[0]
+
+        def pick_best_voxel_at_slice(z_idx: int):
+            m = mask[z_idx]
+            if not np.any(m):
+                return None
+            d = dist_mm[z_idx].copy()
+            d[~m] = -1.0
+            yx = np.unravel_index(int(np.argmax(d)), d.shape)
+            return (z_idx, int(yx[0]), int(yx[1]))
+
+        z_start = None
+        for z_idx in range(zN - 1, -1, -1):
+            if np.any(mask[z_idx]):
+                z_start = int(z_idx)
+                break
+        z_goal = None
+        for z_idx in range(0, zN):
+            if np.any(mask[z_idx]):
+                z_goal = int(z_idx)
+                break
+
+        if z_start is None or z_goal is None:
+            print("  ✗ 掩码在所有切片上为空，无法设置起终点")
+            return False
+
+        start_guess = pick_best_voxel_at_slice(z_start)
+        goal_guess = pick_best_voxel_at_slice(z_goal)
+        if start_guess is None or goal_guess is None:
+            print("  ✗ 起点或终点切片没有有效掩码体素")
+            return False
+
+        start = self._find_nearest_skeleton_voxel(start_guess, skel) or start_guess
+        goal = self._find_nearest_skeleton_voxel(goal_guess, skel) or goal_guess
+
+        # Dijkstra on skeleton voxels
+        import heapq
+        zN, yN, xN = mask.shape
+
+        def lin(zyx):
+            z, y, x = zyx
+            return (z * yN + y) * xN + x
+
+        start_l = lin(start)
+        goal_l = lin(goal)
+
+        offsets = []
+        for oz in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                for ox in (-1, 0, 1):
+                    if oz == 0 and oy == 0 and ox == 0:
+                        continue
+                    offsets.append((oz, oy, ox))
+
+        def step_len_mm(oz, oy, ox):
+            return float(np.sqrt((oz * dz_mm) ** 2 + (oy * dy_mm) ** 2 + (ox * dx_mm) ** 2))
+
+        heap = [(0.0, start_l)]
+        dist = {start_l: 0.0}
+        parent = {start_l: None}
+        visited = 0
+
+        while heap:
+            cur_d, cur_l = heapq.heappop(heap)
+            if cur_l == goal_l:
+                break
+            if cur_d != dist.get(cur_l, None):
+                continue
+            visited += 1
+            # 解码
+            z = cur_l // (yN * xN)
+            rem = cur_l - z * (yN * xN)
+            y = rem // xN
+            x = rem - y * xN
+            for oz, oy, ox in offsets:
+                nz, ny, nx = z + oz, y + oy, x + ox
+                if not (0 <= nz < zN and 0 <= ny < yN and 0 <= nx < xN):
+                    continue
+                if not skel[nz, ny, nx]:
+                    continue
+                wall_d = float(dist_mm[nz, ny, nx])
+                # dist很小时给大惩罚，迫使路径远离壁
+                cost = step_len_mm(oz, oy, ox) * (1.0 / (wall_d + 1e-3)) ** float(wall_bias_power)
+                nl = (nz * yN + ny) * xN + nx
+                nd = cur_d + cost
+                if nd < dist.get(nl, float("inf")):
+                    dist[nl] = nd
+                    parent[nl] = cur_l
+                    heapq.heappush(heap, (nd, nl))
+
+        if goal_l not in parent:
+            print("  ✗ 骨架上未找到连通路径（可能骨架断裂）")
+            return False
+
+        # 回溯路径
+        path_l = []
+        cur = goal_l
+        while cur is not None:
+            path_l.append(cur)
+            cur = parent[cur]
+        path_l.reverse()
+
+        path_zyx = np.zeros((len(path_l), 3), dtype=np.int32)
+        for i, ll in enumerate(path_l):
+            z = ll // (yN * xN)
+            rem = ll - z * (yN * xN)
+            y = rem // xN
+            x = rem - y * xN
+            path_zyx[i] = (z, y, x)
+
+        print(f"  骨架路径长度: {len(path_zyx)}点（visited={visited:,}）")
+
+        # 转为物理坐标(mm)用于平滑与转弯半径约束
+        # ROI内像素坐标 -> 原始全局像素坐标 -> mm
+        x1_orig, y1_orig = self.roi_offset  # 原始分辨率ROI偏移
+        row_mm, col_mm = dy_mm, dx_mm
+        pts_mm = np.zeros((len(path_zyx), 3), dtype=np.float64)
+        for i, (z_idx, y_roi, x_roi) in enumerate(path_zyx):
+            z_mm = float(self.slices_data[int(z_idx)][0])
+            x_orig = float(int(x_roi) + int(x1_orig))
+            y_orig = float(int(y_roi) + int(y1_orig))
+            pts_mm[i] = (x_orig * col_mm, y_orig * row_mm, z_mm)
+
+        # 重采样 + 样条平滑，尽量满足最小转弯半径
+        pts_mm = self._resample_polyline_by_step(pts_mm, resample_step_mm)
+        best_mm = pts_mm
+        best_r = self._polyline_min_turn_radius_mm(best_mm)
+
+        if len(pts_mm) >= 4:
+            for it in range(max_smoothing_iters):
+                # splprep需要参数t，使用弧长参数化更稳定
+                try:
+                    # s从小到大递增：更平滑 -> 更大转弯半径（但可能偏离中心）
+                    s_val = float((it + 1) * 5.0)
+                    tck, _ = splprep([pts_mm[:, 0], pts_mm[:, 1], pts_mm[:, 2]], s=s_val, k=3)
+                    u = np.linspace(0.0, 1.0, len(pts_mm))
+                    x_s, y_s, z_s = splev(u, tck)
+                    sm = np.stack([x_s, y_s, z_s], axis=1)
+                    sm = self._resample_polyline_by_step(sm, resample_step_mm)
+                    r = self._polyline_min_turn_radius_mm(sm)
+                    if r > best_r:
+                        best_r = r
+                        best_mm = sm
+                    if r >= float(min_turn_radius_mm):
+                        best_mm = sm
+                        best_r = r
+                        break
+                except Exception:
+                    break
+
+        # 沿路径索引再轻平滑：削弱骨架/样条在局部段的左右摆动，减轻漫游时“抖出管壁感”
+        try:
+            from scipy.ndimage import gaussian_filter1d
+            sig = 1.15
+            for d in range(3):
+                best_mm[:, d] = gaussian_filter1d(best_mm[:, d], sigma=sig, mode="nearest")
+            best_mm = self._resample_polyline_by_step(best_mm, resample_step_mm)
+            best_r = self._polyline_min_turn_radius_mm(best_mm)
+        except Exception:
+            pass
+
+        print(f"  最小转弯半径(估计): {best_r:.1f} mm（目标≥{float(min_turn_radius_mm):.1f} mm）")
+
+        # 将平滑后的(mm)路径回写到 Plotly 坐标系（x_ds,y_ds,z_mm）并保存体素索引近似
+        # 这里做“近似回投影”：用mm反算原始像素坐标，再减去ROI偏移得到y_roi/x_roi
+        scale_factor = self.downsample_size / self.original_size[0]
+        x_ds = (best_mm[:, 0] / col_mm) * scale_factor
+        y_ds = (best_mm[:, 1] / row_mm) * scale_factor
+        z_mm_arr = best_mm[:, 2]
+        self.navigation_path_plotly = np.stack([x_ds, y_ds, z_mm_arr], axis=1).astype(np.float32)
+
+        # voxel路径用于调试/后续映射：z_idx用“最近切片”匹配
+        z_positions = np.array([float(z) for z, _, _ in self.slices_data], dtype=np.float64)
+        voxel_path = np.zeros((len(best_mm), 3), dtype=np.int32)
+        for i in range(len(best_mm)):
+            z_idx = int(np.argmin(np.abs(z_positions - float(best_mm[i, 2]))))
+            x_orig = int(round(float(best_mm[i, 0]) / col_mm))
+            y_orig = int(round(float(best_mm[i, 1]) / row_mm))
+            voxel_path[i, 0] = z_idx
+            voxel_path[i, 1] = int(y_orig - int(y1_orig))
+            voxel_path[i, 2] = int(x_orig - int(x1_orig))
+        self.navigation_path_voxel = voxel_path
+
+        self.navigation_meta = {
+            "min_turn_radius_mm_target": float(min_turn_radius_mm),
+            "min_turn_radius_mm_estimated": float(best_r if np.isfinite(best_r) else 0.0),
+            "resample_step_mm": float(resample_step_mm),
+            "wall_bias_power": float(wall_bias_power),
+            "spacing_mm": {"dz": float(dz_mm), "dy": float(dy_mm), "dx": float(dx_mm)},
+            "direction": "zmax_to_zmin",
+        }
+
+        return True
     
     def step1_load_and_sort_dicom(self, z_min=None, z_max=None):
         """步骤1: 加载DICOM并按ImagePositionPatient的Z坐标排序"""
@@ -2009,6 +2356,9 @@ class DicomTrachea3DPipeline:
                     z_physical[i] = self.slices_data[-1][0] if z_idx >= len(self.slices_data) else self.slices_data[0][0]
             
             new_verts[:, 2] = z_physical
+
+            self.trachea_lumen_verts = new_verts.astype(np.float64, copy=True)
+            self.trachea_lumen_faces = faces.astype(np.int64, copy=True)
             
             # 添加到图中
             fig.add_trace(go.Mesh3d(
@@ -2029,6 +2379,27 @@ class DicomTrachea3DPipeline:
                 name=name,
                 showlegend=True,
                 visible=visible
+            ))
+            # 反向绕序的同一等值面：法线指向气腔内侧，便于“相机在腔内”时仍能看到壁（WebGL 正面）
+            faces_in = faces[:, [0, 2, 1]].copy()
+            fig.add_trace(go.Mesh3d(
+                x=new_verts[:, 0],
+                y=new_verts[:, 1],
+                z=new_verts[:, 2],
+                i=faces_in[:, 0],
+                j=faces_in[:, 1],
+                k=faces_in[:, 2],
+                color='#86efac',
+                opacity=0.48,
+                lighting=dict(
+                    ambient=0.92,
+                    diffuse=0.42,
+                    roughness=0.92,
+                    specular=0.08
+                ),
+                name='气管内壁(腔内)',
+                showlegend=True,
+                visible=False,
             ))
             
             print(f"  ✓ 充气法3D网格已添加 ({color}, opacity={opacity})")
@@ -2053,10 +2424,12 @@ class DicomTrachea3DPipeline:
                     name='充气中心线',
                     showlegend=True
                 ))
-                print(f"  ✓ 中心线已添加到3D图 (黄色)")
+                print(f"  ✓ 充气中心线已添加到3D图 (黄色)")
             
         except Exception as e:
             print(f"  ✗ 生成充气法网格失败: {e}")
+            self.trachea_lumen_verts = None
+            self.trachea_lumen_faces = None
     
     def step3_generate_mesh(self, downsample_size=256, iso_value=0.5, step_size=2):
         """步骤3: Marching Cubes生成3D网格"""
@@ -2162,8 +2535,10 @@ class DicomTrachea3DPipeline:
                                    use_3d_analysis=False,
                                    use_flood_fill=True,
                                    start_z=-100.0,
-                                   start_idx=None):
-        """步骤4: 创建完整的3D可视化(网格+中心线+横截面+虚拟内窥镜)
+                                   start_idx=None,
+                                   navigation_line=False,
+                                   nav_min_turn_radius_mm=12.0):
+        """步骤4: 创建完整的3D可视化(网格+充气中心线/导航线+横截面+虚拟内窥镜)
         
         参数:
             use_3d_analysis: 是否使用3D分析
@@ -2260,21 +2635,81 @@ class DicomTrachea3DPipeline:
                 visible=True
             )
             used_mask_mesh = True
-        
-        # 2) 中心线（若3D分析已提取）
-        if hasattr(self, 'centerline_world') and self.centerline_world is not None and len(self.centerline_world) > 1:
-            cl = self.centerline_world
-            fig.add_trace(go.Scatter3d(
-                x=cl[:, 0],
-                y=cl[:, 1],
-                z=cl[:, 2],
-                mode='lines+markers',
-                line=dict(color='yellow', width=6),
-                marker=dict(size=3, color='yellow'),
-                name='中心线',
-                showlegend=True
-            ))
-            print(f"✓ 中心线已添加到3D图: {len(cl)}点")
+
+        # 2.5) 导航线（仅用3D掩码 + 几何代价；插管方向：zmax -> zmin）
+        if navigation_line and use_3d_analysis and hasattr(self, 'trachea_mask_3d') and self.trachea_mask_3d is not None:
+            ok = self._compute_navigation_path_from_mask(
+                min_turn_radius_mm=float(nav_min_turn_radius_mm),
+                resample_step_mm=1.0,
+                wall_bias_power=1.5,
+            )
+            if ok and self.navigation_path_plotly is not None and len(self.navigation_path_plotly) > 1:
+                nav = self.navigation_path_plotly
+                fig.add_trace(go.Scatter3d(
+                    x=nav[:, 0],
+                    y=nav[:, 1],
+                    z=nav[:, 2],
+                    mode='lines+markers',
+                    line=dict(color='#00D1B2', width=8),
+                    marker=dict(
+                        size=4,
+                        color='#00D1B2',
+                        line=dict(width=0.5, color='rgba(0,0,0,0.35)'),
+                    ),
+                    opacity=1.0,
+                    name='导航线(插管路径)',
+                    showlegend=True,
+                ))
+                # 漫游相机 eye 位置（由注入脚本 Plotly.restyle 每帧更新）
+                fig.add_trace(go.Scatter3d(
+                    x=[float(nav[0, 0])],
+                    y=[float(nav[0, 1])],
+                    z=[float(nav[0, 2])],
+                    mode='markers',
+                    marker=dict(
+                        size=11,
+                        color='#F472B6',
+                        symbol='diamond',
+                        line=dict(width=2, color='rgba(0,0,0,0.45)'),
+                    ),
+                    name='相机位置(漫游)',
+                    showlegend=True,
+                    hovertemplate='相机位置(漫游)<br>X=%{x:.1f}<br>Y=%{y:.1f}<br>Z=%{z:.1f} mm<extra></extra>',
+                ))
+                n0 = len(nav)
+                j0 = min(3, n0 - 1)
+                p0 = nav[0].astype(np.float64)
+                p1 = nav[j0].astype(np.float64)
+                mid0 = p0 + 0.35 * (p1 - p0)
+                fig.add_trace(go.Scatter3d(
+                    x=[float(p0[0]), float(p1[0])],
+                    y=[float(p0[1]), float(p1[1])],
+                    z=[float(p0[2]), float(p1[2])],
+                    mode='lines',
+                    line=dict(color='#FBBF24', width=5),
+                    name='视线(漫游)',
+                    showlegend=True,
+                    hoverinfo='skip',
+                ))
+                fig.add_trace(go.Scatter3d(
+                    x=[float(mid0[0])],
+                    y=[float(mid0[1])],
+                    z=[float(mid0[2])],
+                    mode='markers',
+                    marker=dict(
+                        size=10,
+                        color='#FB923C',
+                        symbol='cross',
+                        line=dict(width=1, color='rgba(0,0,0,0.35)'),
+                    ),
+                    name='注视点(漫游)',
+                    showlegend=True,
+                    hovertemplate='注视点(漫游)<br>X=%{x:.1f}<br>Y=%{y:.1f}<br>Z=%{z:.1f} mm<extra></extra>',
+                ))
+                print(f"✓ 导航线已添加到3D图: {len(nav)}点")
+            else:
+                print("⚠ 导航线计算失败或点数不足，已跳过绘制")
+        # 充气法网格内已绘制「充气中心线」；此处不再重复添加「中心线」图层
         
         # 3. 添加横截面切片 (对所有切片生成分析)
         if show_cross_sections and self.volume is not None:
@@ -2958,6 +3393,8 @@ class DicomTrachea3DPipeline:
         fig.update_layout(
             scene=dict(
                 aspectmode='data',
+                # orbit 与程序化 scene.camera 更新在部分浏览器上更不易出现「白屏直到点轨道旋转」的 GL 不同步
+                dragmode='orbit',
                 camera=dict(
                     eye=dict(x=1.5, y=1.5, z=1.5),
                     center=dict(x=0, y=0, z=0),
@@ -3017,6 +3454,25 @@ class DicomTrachea3DPipeline:
         # 在HTML最底部添加实验信息（参数/耗时/简介）
         meta_html = self._generate_experiment_meta_html(ended_at=datetime.datetime.now())
         html_content = html_content.replace('</body>', meta_html + '</body>')
+
+        # 在HTML中嵌入导航线点列 + 沿导航线绑定相机（首版：播放/暂停/重置）
+        if navigation_line and self.navigation_path_plotly is not None:
+            try:
+                nav_payload = {
+                    "points_plotly": self.navigation_path_plotly.tolist(),
+                    "meta": self.navigation_meta or {},
+                }
+                nav_script = (
+                    "<script>\n"
+                    "window.__AIRWAY_NAVIGATION__ = "
+                    + json.dumps(nav_payload, ensure_ascii=False)
+                    + ";\n"
+                    "</script>\n"
+                )
+                nav_cam_html = self._generate_navigation_camera_binding_html()
+                html_content = html_content.replace('</body>', nav_script + nav_cam_html + '</body>')
+            except Exception:
+                pass
         
         with open(output_html, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -3026,6 +3482,545 @@ class DicomTrachea3DPipeline:
         print(f"  文件大小: {file_size_mb:.1f} MB")
         
         return fig
+
+    def _generate_navigation_camera_binding_html(self) -> str:
+        """在 HTML 中注入沿导航线更新 Plotly scene.camera 的控件（读取 window.__AIRWAY_NAVIGATION__）。"""
+        return """
+        <div id='navCamPanel' style='position:fixed;bottom:20px;right:20px;background:#0b1220;color:#e5e7eb;padding:10px 12px;border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,0.42);z-index:9998;width:340px;font-family:system-ui,-apple-system,sans-serif;font-size:13px;'>
+            <div id='navCamHeader' style='display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;user-select:none;'>
+                <div style='font-weight:700;color:#fff;letter-spacing:0.2px;'>导航线相机漫游</div>
+                <button id='navCamCollapse' type='button' title='折叠/展开' style='padding:4px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:12px;line-height:1;'>收起</button>
+            </div>
+            <div id='navCamBody' style='margin-top:10px;'>
+                <div style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;'>
+                    <button id='navCamPlay' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#2563eb;color:#fff;cursor:pointer;font-size:12px;font-weight:650;'>播放</button>
+                    <button id='navCamPause' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:12px;'>暂停</button>
+                    <button id='navCamReset' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:12px;'>重置视角</button>
+                </div>
+                <div style='margin:-2px 0 10px;font-size:11px;color:#94a3b8;line-height:1.45;'>播放时：相机<b>严格在导航线当前顶点</b>；对<b>视线方向</b>做一阶混合平滑（拖滑跳帧会立刻对齐 raw）；参考路径<b>前方第 3 个顶点</b>定 raw 方向；点<b>暂停</b>后可自由旋转、缩放。<br/>图例：<b>相机位置</b>（粉菱形）、<b>视线</b>（黄线段 eye→注视点）、<b>注视点</b>（橙十字）与 Plotly 相机一致。<br/><span style='color:#cbd5e1;'>更贴管腔：提高下方 JS 中 <code>navFwdFollow</code>（越接近 1 越跟折线、弯折处可能略抖）。</span></div>
+                <button id='navLumToggle' type='button' style='width:100%;margin-bottom:10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#14532d;color:#ecfdf5;cursor:pointer;font-size:12px;font-weight:700;'>腔内模式：关</button>
+                <div id='navLumState' style='display:none;margin:-4px 0 10px;font-size:11px;color:#a7f3d0;line-height:1.35;'></div>
+                <div style='margin-bottom:10px;'>
+                    <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;font-size:12px;color:#cbd5e1;'>
+                        <span>路径帧 <b id='navCamIdx'>0</b> / <b id='navCamIdxMax'>0</b></span>
+                        <span>Z <b id='navCamZmm'>—</b> mm</span>
+                    </div>
+                    <input id='navCamPath' type='range' min='0' max='0' value='0' step='1' style='width:100%;' />
+                    <div style='margin-top:2px;font-size:11px;color:#64748b;'>顺序与导航线一致（头侧 zmax → zmin）；拖动选帧会自动暂停播放。</div>
+                </div>
+                <label style='display:flex;align-items:center;gap:10px;font-size:12px;color:#cbd5e1;'>
+                    步进间隔 (ms)
+                    <input id='navCamMs' type='range' min='40' max='280' value='110' style='flex:1;' />
+                    <span id='navCamMsLbl'>110</span>
+                </label>
+                <div style='margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.35;'>
+                    掩码体素 1 = <b>气腔（充气连通区域）</b>，不是软组织把心腔填实；MC 网格是包绕气腔的壳，相机在腔内时外表面常为背面。<br/>
+                    点<b>「腔内模式」</b>：隐藏「其他结构/气管外表面」，显示<b>反向法线内壁</b>并加粗导航线，便于腔内看壁形态。
+                </div>
+            </div>
+        </div>
+        <script>
+        (function() {
+            function applyCollapsed(collapsed) {
+                var body = document.getElementById('navCamBody');
+                var btn = document.getElementById('navCamCollapse');
+                if (!body || !btn) return;
+                body.style.display = collapsed ? 'none' : 'block';
+                btn.textContent = collapsed ? '展开' : '收起';
+                try { localStorage.setItem('__NAV_CAM_COLLAPSED__', collapsed ? '1' : '0'); } catch (e) {}
+            }
+            function getCollapsed() {
+                try { return localStorage.getItem('__NAV_CAM_COLLAPSED__') === '1'; } catch (e) { return false; }
+            }
+            function getPts() {
+                try {
+                    var nav = window.__AIRWAY_NAVIGATION__;
+                    if (!nav || !nav.points_plotly || nav.points_plotly.length < 2) return null;
+                    return nav.points_plotly;
+                } catch (e) { return null; }
+            }
+            function getGd() {
+                return document.querySelector('.plotly-graph-div');
+            }
+            function cloneCam(cam) {
+                if (!cam) return null;
+                return {
+                    up: cam.up ? {x: cam.up.x, y: cam.up.y, z: cam.up.z} : {x: 0, y: 0, z: 1},
+                    center: cam.center ? {x: cam.center.x, y: cam.center.y, z: cam.center.z} : {x: 0, y: 0, z: 0},
+                    eye: cam.eye ? {x: cam.eye.x, y: cam.eye.y, z: cam.eye.z} : {x: 1.25, y: 1.25, z: 1.25}
+                };
+            }
+            var timer = null;
+            var idx = 0;
+            var initialCam = null;
+            var lookAhead = 3;
+            var luminalOn = false;
+            // 漫游：eye 始终在路径 pts[ii]；视线用 blendDir 在 rawFwd 上低通，减轻抖晃。
+            // navFwdFollow：每帧朝 rawFwd 靠拢的比例；越大越贴真实折线/管腔走向（窄弯更准），顶点处方向跳变更明显→可能略抖。
+            var navFwdFollow = 0.42;
+            var navSmFwd = null;
+            var navLastIi = null;
+
+            function resetNavCameraSmooth() {
+                navSmFwd = null;
+                navLastIi = null;
+            }
+
+            function blendDir(d0, d1, a) {
+                var x = (1 - a) * d0[0] + a * d1[0];
+                var y = (1 - a) * d0[1] + a * d1[1];
+                var z = (1 - a) * d0[2] + a * d1[2];
+                return norm3([x, y, z]);
+            }
+
+            function traceIdxByName(gd, name) {
+                if (!gd || !gd.data) return null;
+                for (var t = 0; t < gd.data.length; t++) {
+                    if (gd.data[t] && gd.data[t].name === name) return t;
+                }
+                return null;
+            }
+            function restyleVis(gd, ti, vis) {
+                if (ti == null || ti < 0) return;
+                Plotly.restyle(gd, { visible: vis }, [ti]);
+            }
+            function updateNavDebugOverlays(gd, ex, ey, ez, cx, cy, cz) {
+                if (!gd) return;
+                if (!isFinite(ex) || !isFinite(ey) || !isFinite(ez)) return;
+                if (!isFinite(cx) || !isFinite(cy) || !isFinite(cz)) return;
+                var tiE = traceIdxByName(gd, '相机位置(漫游)');
+                var tiG = traceIdxByName(gd, '视线(漫游)');
+                var tiA = traceIdxByName(gd, '注视点(漫游)');
+                try {
+                    if (tiE != null) Plotly.restyle(gd, { x: [[ex]], y: [[ey]], z: [[ez]] }, [tiE]);
+                    if (tiA != null) Plotly.restyle(gd, { x: [[cx]], y: [[cy]], z: [[cz]] }, [tiA]);
+                    if (tiG != null) Plotly.restyle(gd, { x: [[ex, cx]], y: [[ey, cy]], z: [[ez, cz]] }, [tiG]);
+                } catch (e) {}
+            }
+            function applyLuminalMode(on) {
+                luminalOn = !!on;
+                var gd = getGd();
+                var st = document.getElementById('navLumState');
+                if (!gd || !gd.data) {
+                    if (st) { st.style.display = 'none'; }
+                    return;
+                }
+                var bg = traceIdxByName(gd, '其他结构(半透明)');
+                var outer = traceIdxByName(gd, '气管区域(3D充气法)');
+                var inner = traceIdxByName(gd, '气管内壁(腔内)');
+                var nav = traceIdxByName(gd, '导航线(插管路径)');
+                var cl = traceIdxByName(gd, '充气中心线');
+                var camM = traceIdxByName(gd, '相机位置(漫游)');
+                var tiGaze = traceIdxByName(gd, '视线(漫游)');
+                var tiAt = traceIdxByName(gd, '注视点(漫游)');
+                if (luminalOn) {
+                    restyleVis(gd, bg, false);
+                    restyleVis(gd, outer, false);
+                    if (inner != null) {
+                        restyleVis(gd, inner, true);
+                        Plotly.restyle(gd, { opacity: 0.58 }, [inner]);
+                    }
+                    restyleVis(gd, nav, true);
+                    restyleVis(gd, cl, true);
+                    if (camM != null) restyleVis(gd, camM, true);
+                    if (tiGaze != null) restyleVis(gd, tiGaze, true);
+                    if (tiAt != null) restyleVis(gd, tiAt, true);
+                    if (nav != null) Plotly.restyle(gd, { 'line.width': 14, 'marker.size': 8 }, [nav]);
+                    if (st) {
+                        st.style.display = 'block';
+                        st.textContent = inner != null
+                            ? '腔内模式：已显示反向法线内壁；外壁与背景已隐藏。'
+                            : '腔内模式：未找到内壁图层（请用最新脚本重导 HTML）。';
+                    }
+                } else {
+                    restyleVis(gd, bg, true);
+                    restyleVis(gd, outer, true);
+                    if (inner != null) {
+                        restyleVis(gd, inner, false);
+                        Plotly.restyle(gd, { opacity: 0.48 }, [inner]);
+                    }
+                    restyleVis(gd, nav, true);
+                    restyleVis(gd, cl, true);
+                    if (camM != null) restyleVis(gd, camM, true);
+                    if (tiGaze != null) restyleVis(gd, tiGaze, true);
+                    if (tiAt != null) restyleVis(gd, tiAt, true);
+                    if (nav != null) Plotly.restyle(gd, { 'line.width': 8, 'marker.size': 4 }, [nav]);
+                    if (st) { st.style.display = 'none'; }
+                }
+                var b = document.getElementById('navLumToggle');
+                if (b) b.textContent = luminalOn ? '腔内模式：开（再点关闭）' : '腔内模式：关';
+            }
+
+            function pickUp(fx, fy, fz) {
+                var ux = 0, uy = 0, uz = 1;
+                var nx = fx, ny = fy, nz = fz;
+                var fn = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                if (fn > 1e-9) { nx /= fn; ny /= fn; nz /= fn; }
+                var dot = Math.abs(nx * ux + ny * uy + nz * uz);
+                if (dot > 0.92) { ux = 0; uy = 1; uz = 0; }
+                return {x: ux, y: uy, z: uz};
+            }
+
+            function norm3(v) {
+                var l = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+                if (l < 1e-12) return [0, 0, 1];
+                return [v[0]/l, v[1]/l, v[2]/l];
+            }
+
+            function tangentForward(pts, ii) {
+                var n = pts.length;
+                if (n < 2) return [0, 0, 1];
+                if (ii < n - 1) {
+                    return [pts[ii+1][0]-pts[ii][0], pts[ii+1][1]-pts[ii][1], pts[ii+1][2]-pts[ii][2]];
+                }
+                return [pts[n-1][0]-pts[n-2][0], pts[n-1][1]-pts[n-2][1], pts[n-1][2]-pts[n-2][2]];
+            }
+
+            // 用多段中心差分估计切向，避免「相邻两点差分」在密折线上的高频抖动
+            function tangentSmoothed(pts, ii, halfWin) {
+                halfWin = (halfWin == null) ? 5 : halfWin;
+                var n = pts.length;
+                if (n < 2) return [0, 0, 1];
+                var i0 = Math.max(0, ii - halfWin);
+                var i1 = Math.min(n - 1, ii + halfWin);
+                if (i0 === i1) {
+                    return norm3(tangentForward(pts, ii));
+                }
+                var vx = pts[i1][0] - pts[i0][0];
+                var vy = pts[i1][1] - pts[i0][1];
+                var vz = pts[i1][2] - pts[i0][2];
+                return norm3([vx, vy, vz]);
+            }
+
+            function meanStep(pts) {
+                var lim = Math.min(pts.length - 1, 80);
+                var acc = 0, cnt = 0;
+                for (var k = 0; k < lim; k++) {
+                    var dx = pts[k+1][0]-pts[k][0], dy = pts[k+1][1]-pts[k][1], dz = pts[k+1][2]-pts[k][2];
+                    acc += Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    cnt++;
+                }
+                return cnt ? (acc / cnt) : 1.0;
+            }
+
+            function deepMergeCam(oldCam, patch) {
+                try {
+                    var o = oldCam ? JSON.parse(JSON.stringify(oldCam)) : {};
+                    for (var k in patch) { if (Object.prototype.hasOwnProperty.call(patch, k)) o[k] = patch[k]; }
+                    return o;
+                } catch (e) {
+                    return patch;
+                }
+            }
+
+            // 程序化 relayout(scene.camera) 后，部分环境下 WebGL 子图不立刻重绘（白屏），点模式栏「轨道旋转」会触发刷新。
+            // 用 resize / rAF 再触发一次布局，促使 GL 与 layout 同步（见 plotly.js 相关 issue 讨论）。
+            function forceSceneRedraw(gd) {
+                if (!gd) return;
+                function one() {
+                    try {
+                        if (typeof Plotly !== 'undefined' && Plotly.Plots && typeof Plotly.Plots.resize === 'function') {
+                            Plotly.Plots.resize(gd);
+                        }
+                    } catch (e0) {}
+                }
+                one();
+                try {
+                    if (typeof requestAnimationFrame === 'function') {
+                        requestAnimationFrame(function() { one(); });
+                    }
+                } catch (e1) {}
+            }
+
+            function relayoutSceneCameraPatch(gd, patch) {
+                if (!gd || !patch) return;
+                try {
+                    var p = Plotly.relayout(gd, patch);
+                    if (p && typeof p.then === 'function') {
+                        p.then(function() { forceSceneRedraw(gd); });
+                    } else {
+                        setTimeout(function() { forceSceneRedraw(gd); }, 0);
+                    }
+                } catch (e) {
+                    setTimeout(function() { forceSceneRedraw(gd); }, 0);
+                }
+            }
+
+            // Plotly scene.camera 的 eye/center/up 在「场景域坐标」中：(0,0,0) 为数据包围盒中心，
+            // 量级约与默认 eye=(1.25,1.25,1.25) 相当；不能把导航点的数据坐标(mm/像素)直接写入，否则会白屏。
+            function getSceneCamBasis(gd) {
+                var L = gd._fullLayout || gd.layout;
+                if (!L || !L.scene) return null;
+                var sc = L.scene;
+                var xr = sc.xaxis && sc.xaxis.range;
+                var yr = sc.yaxis && sc.yaxis.range;
+                var zr = sc.zaxis && sc.zaxis.range;
+                if (!xr || xr.length < 2 || !yr || yr.length < 2 || !zr || zr.length < 2) return null;
+                var x0 = Math.min(xr[0], xr[1]), x1 = Math.max(xr[0], xr[1]);
+                var y0 = Math.min(yr[0], yr[1]), y1 = Math.max(yr[0], yr[1]);
+                var z0 = Math.min(zr[0], zr[1]), z1 = Math.max(zr[0], zr[1]);
+                var cx = (x0 + x1) * 0.5, cy = (y0 + y1) * 0.5, cz = (z0 + z1) * 0.5;
+                var hx = Math.max(1e-12, (x1 - x0) * 0.5);
+                var hy = Math.max(1e-12, (y1 - y0) * 0.5);
+                var hz = Math.max(1e-12, (z1 - z0) * 0.5);
+                var ar = sc.aspectratio || {x: 1, y: 1, z: 1};
+                var ax = (ar.x != null) ? ar.x : 1;
+                var ay = (ar.y != null) ? ar.y : 1;
+                var az = (ar.z != null) ? ar.z : 1;
+                return { cx: cx, cy: cy, cz: cz, hx: hx, hy: hy, hz: hz, ax: ax, ay: ay, az: az };
+            }
+            function dataPointToSceneCam(pt, b) {
+                if (!b) return null;
+                return {
+                    x: 0.5 * b.ax * (pt[0] - b.cx) / b.hx,
+                    y: 0.5 * b.ay * (pt[1] - b.cy) / b.hy,
+                    z: 0.5 * b.az * (pt[2] - b.cz) / b.hz
+                };
+            }
+
+            function getSceneCamBasisFromTraces(gd) {
+                if (!gd || !gd.data) return null;
+                var xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity, zmin = Infinity, zmax = -Infinity;
+                function accArr(xa, ya, za) {
+                    if (!xa || !ya || !za) return;
+                    var n = Math.min(xa.length, ya.length, za.length);
+                    for (var k = 0; k < n; k++) {
+                        var x = xa[k], y = ya[k], z = za[k];
+                        if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+                        if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+                        if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+                        if (z < zmin) zmin = z; if (z > zmax) zmax = z;
+                    }
+                }
+                for (var t = 0; t < gd.data.length; t++) {
+                    var tr = gd.data[t];
+                    if (!tr) continue;
+                    if (tr.type === 'scatter3d' || tr.type === 'mesh3d') {
+                        accArr(tr.x, tr.y, tr.z);
+                    }
+                }
+                if (!isFinite(xmin) || !isFinite(xmax)) return null;
+                var cx = (xmin + xmax) * 0.5, cy = (ymin + ymax) * 0.5, cz = (zmin + zmax) * 0.5;
+                var hx = Math.max(1e-12, (xmax - xmin) * 0.5);
+                var hy = Math.max(1e-12, (ymax - ymin) * 0.5);
+                var hz = Math.max(1e-12, (zmax - zmin) * 0.5);
+                return { cx: cx, cy: cy, cz: cz, hx: hx, hy: hy, hz: hz, ax: 1, ay: 1, az: 1 };
+            }
+
+            function getSceneCamBasisAny(gd) {
+                var b = getSceneCamBasis(gd);
+                if (b) return b;
+                return getSceneCamBasisFromTraces(gd);
+            }
+
+            function applyCameraForIndex(pts, i, skipRelayout) {
+                var gd = getGd();
+                if (!gd || !pts || pts.length < 2) return;
+                var n = pts.length;
+                var ii = Math.max(0, Math.min(n - 1, i | 0));
+                var step = meanStep(pts);
+                var lookLen = Math.max(step * 2.5, 1.2);
+                var lookSegs = 3;
+                var j = Math.min(n - 1, ii + lookSegs);
+                var rawEx = pts[ii][0];
+                var rawEy = pts[ii][1];
+                var rawEz = pts[ii][2];
+                var tx = pts[j][0];
+                var ty = pts[j][1];
+                var tz = pts[j][2];
+                var rdx = tx - rawEx;
+                var rdy = ty - rawEy;
+                var rdz = tz - rawEz;
+                var rdist = Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+                if (rdist < 1e-4) {
+                    var fwb = tangentSmoothed(pts, Math.max(0, ii - 1), 8);
+                    tx = rawEx + fwb[0] * lookLen;
+                    ty = rawEy + fwb[1] * lookLen;
+                    tz = rawEz + fwb[2] * lookLen;
+                    rdx = tx - rawEx;
+                    rdy = ty - rawEy;
+                    rdz = tz - rawEz;
+                }
+                var rawFwd = norm3([tx - rawEx, ty - rawEy, tz - rawEz]);
+                var jump = (navLastIi == null || Math.abs(ii - navLastIi) > 2);
+                if (navSmFwd == null || jump) {
+                    navSmFwd = rawFwd.slice();
+                } else {
+                    navSmFwd = blendDir(navSmFwd, rawFwd, navFwdFollow);
+                }
+                navLastIi = ii;
+                var ex = rawEx;
+                var ey = rawEy;
+                var ez = rawEz;
+                var lookDist = Math.max(step * 3.5, 2.0);
+                var cx = ex + navSmFwd[0] * lookDist;
+                var cy = ey + navSmFwd[1] * lookDist;
+                var cz = ez + navSmFwd[2] * lookDist;
+                updateNavDebugOverlays(gd, ex, ey, ez, cx, cy, cz);
+                if (skipRelayout) return;
+                var b = getSceneCamBasisAny(gd);
+                if (!b) return;
+                var eyeC = dataPointToSceneCam([ex, ey, ez], b);
+                var centerC = dataPointToSceneCam([cx, cy, cz], b);
+                if (!eyeC || !centerC) return;
+                if (!isFinite(eyeC.x) || !isFinite(centerC.x)) return;
+                var fxc = centerC.x - eyeC.x, fyc = centerC.y - eyeC.y, fzc = centerC.z - eyeC.z;
+                var up = pickUp(fxc, fyc, fzc);
+                var oldCam = (gd.layout && gd.layout.scene && gd.layout.scene.camera) ? gd.layout.scene.camera : {};
+                var patch = {
+                    'scene.camera.eye': { x: eyeC.x, y: eyeC.y, z: eyeC.z },
+                    'scene.camera.center': { x: centerC.x, y: centerC.y, z: centerC.z },
+                    'scene.camera.up': { x: up.x, y: up.y, z: up.z }
+                };
+                try {
+                    if (oldCam && oldCam.projection) {
+                        patch['scene.camera.projection'] = JSON.parse(JSON.stringify(oldCam.projection));
+                    }
+                } catch (ep) {}
+                relayoutSceneCameraPatch(gd, patch);
+            }
+
+            function syncPathUi(pts, i) {
+                var path = document.getElementById('navCamPath');
+                var iLbl = document.getElementById('navCamIdx');
+                var mLbl = document.getElementById('navCamIdxMax');
+                var zLbl = document.getElementById('navCamZmm');
+                if (!pts || pts.length < 1) return;
+                var n = pts.length;
+                var ii = Math.max(0, Math.min(n - 1, i | 0));
+                if (path) {
+                    path.min = '0';
+                    path.max = String(Math.max(0, n - 1));
+                    path.value = String(ii);
+                }
+                if (iLbl) iLbl.textContent = String(ii);
+                if (mLbl) mLbl.textContent = String(Math.max(0, n - 1));
+                if (zLbl) {
+                    var z = pts[ii][2];
+                    zLbl.textContent = (z != null && isFinite(z)) ? Number(z).toFixed(1) : '—';
+                }
+            }
+
+            function stop() {
+                if (timer) { clearInterval(timer); timer = null; }
+            }
+
+            function start() {
+                var pts = getPts();
+                if (!pts) return;
+                stop();
+                var msInput = document.getElementById('navCamMs');
+                var ms = msInput ? parseInt(msInput.value, 10) : 80;
+                if (!isFinite(ms) || ms < 10) ms = 110;
+                timer = setInterval(function() {
+                    var pts2 = getPts();
+                    if (!pts2) { stop(); return; }
+                    applyCameraForIndex(pts2, idx);
+                    syncPathUi(pts2, idx);
+                    idx += 1;
+                    if (idx >= pts2.length) idx = 0;
+                }, ms);
+            }
+
+            function resetCam() {
+                stop();
+                resetNavCameraSmooth();
+                var gd = getGd();
+                var pts = getPts();
+                idx = 0;
+                if (pts) syncPathUi(pts, 0);
+                if (pts && gd) applyCameraForIndex(pts, 0, true);
+                if (!gd || !initialCam) return;
+                relayoutSceneCameraPatch(gd, { 'scene.camera': initialCam });
+            }
+
+            function wire() {
+                // 右下角面板：可折叠
+                var header = document.getElementById('navCamHeader');
+                var col = document.getElementById('navCamCollapse');
+                var collapsed = getCollapsed();
+                applyCollapsed(collapsed);
+                function toggleCollapsed(ev) {
+                    try { if (ev && ev.preventDefault) ev.preventDefault(); } catch (e) {}
+                    collapsed = !collapsed;
+                    applyCollapsed(collapsed);
+                }
+                if (col) col.addEventListener('click', function(ev) { toggleCollapsed(ev); });
+                if (header) header.addEventListener('click', function(ev) {
+                    // 点击标题栏也可折叠；但点按钮会冒泡到 header，因此这里忽略按钮本身
+                    if (ev && ev.target && ev.target.id === 'navCamCollapse') return;
+                    toggleCollapsed(ev);
+                });
+                var play = document.getElementById('navCamPlay');
+                var pause = document.getElementById('navCamPause');
+                var reset = document.getElementById('navCamReset');
+                var ms = document.getElementById('navCamMs');
+                var msLbl = document.getElementById('navCamMsLbl');
+                var path = document.getElementById('navCamPath');
+                if (play) play.addEventListener('click', start);
+                if (pause) pause.addEventListener('click', stop);
+                if (reset) reset.addEventListener('click', resetCam);
+                if (ms && msLbl) {
+                    ms.addEventListener('input', function() { msLbl.textContent = String(ms.value); });
+                }
+                if (path) {
+                    path.addEventListener('input', function() {
+                        var pts = getPts();
+                        if (!pts) return;
+                        stop();
+                        idx = parseInt(path.value, 10) || 0;
+                        idx = Math.max(0, Math.min(pts.length - 1, idx));
+                        applyCameraForIndex(pts, idx);
+                        syncPathUi(pts, idx);
+                    });
+                }
+                var lumBtn = document.getElementById('navLumToggle');
+                if (lumBtn) lumBtn.addEventListener('click', function() { applyLuminalMode(!luminalOn); });
+            }
+
+            function captureInitial() {
+                var gd = getGd();
+                if (!gd || !gd.layout || !gd.layout.scene || !gd.layout.scene.camera) return;
+                if (!initialCam) initialCam = cloneCam(gd.layout.scene.camera);
+            }
+
+            function boot() {
+                var pts = getPts();
+                if (!pts) return;
+                lookAhead = Math.max(1, Math.floor(pts.length * 0.03));
+                idx = 0;
+                syncPathUi(pts, 0);
+                var gd = getGd();
+                var capDone = false;
+                function onAfter() {
+                    if (capDone) return;
+                    captureInitial();
+                    if (initialCam) {
+                        capDone = true;
+                        forceSceneRedraw(getGd());
+                    }
+                }
+                if (gd && gd.on) {
+                    gd.on('plotly_afterplot', onAfter);
+                }
+                setTimeout(function() {
+                    captureInitial();
+                    forceSceneRedraw(getGd());
+                    var g2 = getGd();
+                    var p2 = getPts();
+                    if (g2 && p2 && p2.length) applyCameraForIndex(p2, 0, true);
+                }, 300);
+                wire();
+            }
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', boot);
+            } else {
+                boot();
+            }
+        })();
+        </script>
+        """
     
     def _generate_slider_control(self):
         """生成切片滑块控件的HTML和JavaScript代码 - 全新重写版本"""
@@ -3343,15 +4338,18 @@ class DicomTrachea3DPipeline:
     
     def run_full_pipeline(self, z_min=None, z_max=None, downsample_size=256,
                          iso_value=0.5, step_size=2, output_html=None,
-                         show_endoscopy=False, 
+                         show_endoscopy=False,
                          show_cross_sections=True, cross_section_interval=10,
                          auto_open=True, use_3d_analysis=False, use_flood_fill=True,
-                         start_z=-100.0, start_idx=None):
+                         start_z=-100.0, start_idx=None,
+                         navigation_line=False, nav_min_turn_radius_mm=12.0,
+                         vtk_flythrough_mp4=None):
         """运行完整流程
         
         参数:
             use_3d_analysis: 是否使用3D分析
             use_flood_fill: True=充气法(3D连通性,推荐), False=传统传播法
+            vtk_flythrough_mp4: 若为非空字符串，则在流程末尾尝试导出 PyVista 虚拟内镜 MP4（需安装 pyvista 与 imageio-ffmpeg）。
         """
         print("\n" + "🏥 "*30)
         print("DICOM气管3D重建流程")
@@ -3372,7 +4370,20 @@ class DicomTrachea3DPipeline:
         # 步骤3: 可视化
         fig = self.step4_create_visualization(output_html, show_endoscopy,
                                               show_cross_sections, cross_section_interval,
-                                              use_3d_analysis, use_flood_fill, start_z, start_idx)
+                                              use_3d_analysis, use_flood_fill, start_z, start_idx,
+                                              navigation_line, nav_min_turn_radius_mm)
+
+        if vtk_flythrough_mp4:
+            try:
+                from virtual_endoscopy_pyvista import export_from_pipeline
+                print("\n" + "=" * 60)
+                print("PyVista 虚拟内镜（离屏 MP4）")
+                print("=" * 60)
+                okv = export_from_pipeline(self, vtk_flythrough_mp4)
+                if okv and output_html:
+                    print(f"  可与 HTML 对照: {output_html}")
+            except Exception as e:
+                print(f"⚠ 虚拟内镜 MP4 导出失败: {e}")
         
         # 总结
         print("\n" + "="*60)
@@ -3463,6 +4474,19 @@ def main():
                             help='3D分析起始Z坐标(mm)【必填二选一: --start-z 或 --start-idx】')
     seed_group.add_argument('--start-idx', type=int, default=None,
                             help='3D分析起始z_idx【必填二选一: --start-z 或 --start-idx】')
+
+    parser.add_argument('--navigation-line', action='store_true',
+                       help='从3D二值掩码提取插管导航线，并绘制到3D图层（仅用体素图+几何代价）')
+    parser.add_argument('--nav-min-radius', type=float, default=12.0,
+                       help='导航线最小转弯半径(mm)约束的目标值(默认: 12.0)')
+    parser.add_argument(
+        '--vtk-flythrough',
+        nargs='?',
+        default=None,
+        const='',
+        metavar='OUT.mp4',
+        help='导出 PyVista 离屏虚拟内镜 MP4（内壁网格+射线锥前向）；不写路径则输出到 output/<前缀>_flythrough_<时间>.mp4。需: pip install pyvista imageio-ffmpeg',
+    )
     
     args = parser.parse_args()
     
@@ -3483,9 +4507,26 @@ def main():
         os.makedirs(output_dir)
         print(f"✅ 创建输出目录: {output_dir}/")
     
+    # 本次运行输出目录（按时间戳分组）
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(output_dir, ts)
+    if os.path.exists(run_dir):
+        # 极少数情况下同秒多次启动，追加序号避免覆盖
+        k = 2
+        while os.path.exists(f"{run_dir}_{k}"):
+            k += 1
+        run_dir = f"{run_dir}_{k}"
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"📦 本次输出目录: {run_dir}{os.sep}")
+
     # 输出文件路径
-    ts = datetime.datetime.now().strftime("%m%d_%H%M")
-    output_html = os.path.join(output_dir, f"{args.output}_3d_{ts}.html")
+    output_html = os.path.join(run_dir, f"{args.output}_3d_{ts}.html")
+    fly_mp4 = None
+    if args.vtk_flythrough is not None:
+        if args.vtk_flythrough == '':
+            fly_mp4 = os.path.join(run_dir, f"{args.output}_flythrough_{ts}.mp4")
+        else:
+            fly_mp4 = args.vtk_flythrough
     
     # 创建流程对象
     pipeline = DicomTrachea3DPipeline(
@@ -3515,7 +4556,10 @@ def main():
         use_3d_analysis=args.use_3d_analysis,
         use_flood_fill=not args.use_propagation,  # 默认使用充气法
         start_z=args.start_z,
-        start_idx=args.start_idx
+        start_idx=args.start_idx,
+        navigation_line=args.navigation_line,
+        nav_min_turn_radius_mm=args.nav_min_radius,
+        vtk_flythrough_mp4=fly_mp4,
     )
     
     return 0 if success else 1
