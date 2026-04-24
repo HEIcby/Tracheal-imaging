@@ -297,6 +297,90 @@ def export_flythrough_mp4(
     return True
 
 
+def compute_camera_hints(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    path_xyz: np.ndarray,
+    *,
+    max_ray_mm: float = 85.0,
+    semi_deg: float = 34.0,
+    n_ring: int = 14,
+    blend_tangent: float = 0.42,
+    focal_frac: float = 0.38,
+    focal_min_mm: float = 8.0,
+    focal_max_mm: float = 55.0,
+) -> dict:
+    """
+    为给定路径离线预计算相机提示量（用于 HTML/Plotly 沿路径漫游）：
+    - fwd[i]: 通过「锥形多射线可视性 + 与切向混合」得到的前向（世界坐标单位向量）
+    - lookDist[i]: 通过「前向锥自由距离」自适应得到的注视距离（mm）
+
+    返回:
+      { "fwd": (N,3) list, "lookDist": (N,) list }
+    """
+    try:
+        import pyvista as pv  # noqa: WPS433
+    except ImportError as e:
+        raise ImportError(
+            f"compute_camera_hints 需要 pyvista: {e}. 请执行: pip install pyvista"
+        ) from e
+
+    verts = np.asarray(verts, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    path = np.asarray(path_xyz, dtype=np.float64)
+    if path.ndim != 2 or path.shape[0] < 3 or path.shape[1] != 3:
+        return {"fwd": [], "lookDist": []}
+
+    n_faces = faces.shape[0]
+    f_flat = np.empty(n_faces * 4, dtype=np.int64)
+    f_flat[0::4] = 3
+    f_flat[1::4] = faces[:, 0]
+    f_flat[2::4] = faces[:, 1]
+    f_flat[3::4] = faces[:, 2]
+    surf = pv.PolyData(verts, f_flat)
+    surf.compute_normals(
+        inplace=True,
+        cell_normals=False,
+        point_normals=True,
+        consistent_normals=True,
+        auto_orient_normals=True,
+    )
+
+    n = int(path.shape[0])
+    fwd_all = np.zeros((n, 3), dtype=np.float64)
+    look_all = np.zeros((n,), dtype=np.float64)
+
+    for i in range(n):
+        eye = path[i]
+        i_prev = max(0, i - 1)
+        i_next = min(n - 1, i + 1)
+        tangent = path[i_next] - path[i_prev]
+        if np.linalg.norm(tangent) < 1e-9:
+            tangent = path[min(i + 1, n - 1)] - path[i]
+        fwd = _visibility_forward(
+            surf,
+            eye,
+            tangent,
+            max_ray_mm=float(max_ray_mm),
+            semi_deg=float(semi_deg),
+            n_ring=int(n_ring),
+            blend_tangent=float(blend_tangent),
+        )
+        fwd_all[i] = fwd
+
+        scores = []
+        for di in _cone_directions(
+            fwd / (np.linalg.norm(fwd) + 1e-12), 28.0, 10
+        ):
+            scores.append(_ray_free_length(surf, eye, di, float(max_ray_mm)))
+        med_free = float(np.median(scores)) if scores else float(max_ray_mm) * 0.35
+        look_all[i] = float(
+            np.clip(float(focal_frac) * med_free, float(focal_min_mm), float(focal_max_mm))
+        )
+
+    return {"fwd": fwd_all.tolist(), "lookDist": look_all.tolist()}
+
+
 def export_from_pipeline(pipeline, output_mp4: str, **kwargs) -> bool:
     """从 DicomTrachea3DPipeline 实例导出（需已完成充气法网格与路径）。"""
     verts = getattr(pipeline, "trachea_lumen_verts", None)

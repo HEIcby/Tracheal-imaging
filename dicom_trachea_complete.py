@@ -2382,24 +2382,85 @@ class DicomTrachea3DPipeline:
             ))
             # 反向绕序的同一等值面：法线指向气腔内侧，便于“相机在腔内”时仍能看到壁（WebGL 正面）
             faces_in = faces[:, [0, 2, 1]].copy()
+            # 可选：对“腔内内壁”网格做平滑，减少三角面法线突变导致的黑面/阴影断裂
+            inner_verts = new_verts
+            inner_faces = faces_in
+            try:
+                import pyvista as pv  # noqa: WPS433
+
+                f_flat = np.empty(inner_faces.shape[0] * 4, dtype=np.int64)
+                f_flat[0::4] = 3
+                f_flat[1::4] = inner_faces[:, 0]
+                f_flat[2::4] = inner_faces[:, 1]
+                f_flat[3::4] = inner_faces[:, 2]
+                poly = pv.PolyData(inner_verts.astype(np.float64), f_flat)
+                # 轻量平滑：尽量不改变整体形状，只减少“面片感/黑块”
+                poly_s = poly.smooth(
+                    n_iter=30,
+                    relaxation_factor=0.02,
+                    feature_smoothing=False,
+                    boundary_smoothing=True,
+                )
+                pts = np.asarray(poly_s.points, dtype=np.float64)
+                if pts.shape == inner_verts.shape and np.isfinite(pts).all():
+                    inner_verts = pts
+            except Exception:
+                pass
             fig.add_trace(go.Mesh3d(
-                x=new_verts[:, 0],
-                y=new_verts[:, 1],
-                z=new_verts[:, 2],
-                i=faces_in[:, 0],
-                j=faces_in[:, 1],
-                k=faces_in[:, 2],
+                x=inner_verts[:, 0],
+                y=inner_verts[:, 1],
+                z=inner_verts[:, 2],
+                i=inner_faces[:, 0],
+                j=inner_faces[:, 1],
+                k=inner_faces[:, 2],
+                # 平滑着色：使用插值法线（更接近 VTK 的顺滑观感）
+                flatshading=False,
                 color='#86efac',
                 opacity=0.48,
                 lighting=dict(
-                    ambient=0.92,
-                    diffuse=0.42,
+                    # 腔内模式：更强的深度感（更低 ambient、更高 diffuse），同时降低高光闪烁
+                    # 第二轮实验：提升整体亮度与深度线索（防黑面），同时控制高光稳定性
+                    # 第三轮实验：更“漫反射/填充光”，减少“方向性很强”的亮暗反转
+                    # 第六轮实验：平滑着色 + 光照重配（避免平滑法线下发灰/发黑）
+                    ambient=0.52,
+                    diffuse=0.90,
                     roughness=0.92,
-                    specular=0.08
+                    specular=0.10,
+                    fresnel=0.10,
+                    # 经验修复：减少 mesh3d 的法线/光照伪影（plotly 社区常见止血配置）
+                    vertexnormalsepsilon=0,
+                    facenormalsepsilon=0,
                 ),
+                lightposition=dict(x=200, y=200, z=400),
                 name='气管内壁(腔内)',
                 showlegend=True,
                 visible=False,
+            ))
+            # 腔内“填充补光层”：用于抬亮凹面/背光处（近似 VTK 内镜的环形填充光）
+            # 思路：不依赖强方向光，只提供低透明度的均匀填充，避免凹面死黑。
+            fig.add_trace(go.Mesh3d(
+                x=inner_verts[:, 0],
+                y=inner_verts[:, 1],
+                z=inner_verts[:, 2],
+                i=inner_faces[:, 0],
+                j=inner_faces[:, 1],
+                k=inner_faces[:, 2],
+                flatshading=False,
+                color='#d1fae5',
+                opacity=0.12,
+                lighting=dict(
+                    ambient=1.0,
+                    diffuse=0.0,
+                    roughness=1.0,
+                    specular=0.0,
+                    fresnel=0.0,
+                    vertexnormalsepsilon=0,
+                    facenormalsepsilon=0,
+                ),
+                name='气管内壁(腔内-填充)',
+                showlegend=False,
+                visible=False,
+                hoverinfo='skip',
             ))
             
             print(f"  ✓ 充气法3D网格已添加 ({color}, opacity={opacity})")
@@ -2630,7 +2691,8 @@ class DicomTrachea3DPipeline:
             self._add_flood_fill_mesh_to_figure(
                 fig,
                 color='green',
-                opacity=0.65,
+                # 对照：默认态更接近不透明
+                opacity=1.0,
                 name='气管区域(3D充气法)',
                 visible=True
             )
@@ -3308,7 +3370,7 @@ class DicomTrachea3DPipeline:
                             showscale=False,
                             opacity=0.3,
                             visible=(z_idx == getattr(self, 'initial_display_z', 30)),
-                            name=f'切片 Z={z_idx} CT图像 ({z_physical:.1f}mm)',
+                        name=f'切片 Z={z_idx} CT图像平面 ({z_physical:.1f}mm)',
                             legendgroup=f'slice_{z_idx}',
                             showlegend=False,
                             hoverinfo='skip'
@@ -3462,6 +3524,31 @@ class DicomTrachea3DPipeline:
                     "points_plotly": self.navigation_path_plotly.tolist(),
                     "meta": self.navigation_meta or {},
                 }
+                # 实验 1：只改相机（不改导航线）——离线预计算 cam.fwd/lookDist，注入 HTML 供 JS 使用
+                try:
+                    from virtual_endoscopy_pyvista import compute_camera_hints  # noqa: WPS433
+
+                    verts = getattr(self, "trachea_lumen_verts", None)
+                    faces = getattr(self, "trachea_lumen_faces", None)
+                    if verts is not None and faces is not None and len(self.navigation_path_plotly) >= 3:
+                        cam = compute_camera_hints(
+                            verts,
+                            faces,
+                            np.asarray(self.navigation_path_plotly, dtype=np.float64),
+                            max_ray_mm=85.0,
+                            semi_deg=34.0,
+                            n_ring=14,
+                            blend_tangent=0.42,
+                            focal_frac=0.38,
+                            focal_min_mm=8.0,
+                            focal_max_mm=55.0,
+                        )
+                        if isinstance(cam, dict) and cam.get("fwd") and cam.get("lookDist"):
+                            nav_payload["cam"] = cam
+                            nav_payload["cam"]["source"] = "ray_mesh_cone"
+                except Exception:
+                    # 缺 pyvista / 网格缺失 / 计算失败都不影响 HTML 输出；前端会回退旧逻辑
+                    pass
                 nav_script = (
                     "<script>\n"
                     "window.__AIRWAY_NAVIGATION__ = "
@@ -3498,7 +3585,18 @@ class DicomTrachea3DPipeline:
                     <button id='navCamReset' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:12px;'>重置视角</button>
                 </div>
                 <div style='margin:-2px 0 10px;font-size:11px;color:#94a3b8;line-height:1.45;'>播放时：相机<b>严格在导航线当前顶点</b>；对<b>视线方向</b>做一阶混合平滑（拖滑跳帧会立刻对齐 raw）；参考路径<b>前方第 3 个顶点</b>定 raw 方向；点<b>暂停</b>后可自由旋转、缩放。<br/>图例：<b>相机位置</b>（粉菱形）、<b>视线</b>（黄线段 eye→注视点）、<b>注视点</b>（橙十字）与 Plotly 相机一致。<br/><span style='color:#cbd5e1;'>更贴管腔：提高下方 JS 中 <code>navFwdFollow</code>（越接近 1 越跟折线、弯折处可能略抖）。</span></div>
-                <button id='navLumToggle' type='button' style='width:100%;margin-bottom:10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#14532d;color:#ecfdf5;cursor:pointer;font-size:12px;font-weight:700;'>腔内模式：关</button>
+                <button id='navLumToggle' type='button' style='width:100%;margin-bottom:8px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#14532d;color:#ecfdf5;cursor:pointer;font-size:12px;font-weight:700;'>模式：腔外</button>
+                <label style='display:flex;align-items:center;justify-content:space-between;gap:10px;margin:-2px 0 10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#cbd5e1;font-size:12px;'>
+                    <span>气管配色</span>
+                    <select id='navColorTheme' style='flex:1;max-width:180px;margin-left:10px;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;'>
+                        <option value='green'>绿色</option>
+                        <option value='blue'>蓝色</option>
+                        <option value='red'>红色</option>
+                        <option value='beige'>米色</option>
+                        <option value='flesh'>肉色</option>
+                    </select>
+                </label>
+                <div id='navSliceMount' style='margin:0 0 10px;'></div>
                 <div id='navLumState' style='display:none;margin:-4px 0 10px;font-size:11px;color:#a7f3d0;line-height:1.35;'></div>
                 <div style='margin-bottom:10px;'>
                     <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;font-size:12px;color:#cbd5e1;'>
@@ -3539,6 +3637,15 @@ class DicomTrachea3DPipeline:
                     return nav.points_plotly;
                 } catch (e) { return null; }
             }
+            function getCam() {
+                try {
+                    var nav = window.__AIRWAY_NAVIGATION__;
+                    if (!nav || !nav.cam) return null;
+                    var c = nav.cam;
+                    if (!c.fwd || !c.lookDist) return null;
+                    return c;
+                } catch (e) { return null; }
+            }
             function getGd() {
                 return document.querySelector('.plotly-graph-div');
             }
@@ -3554,12 +3661,20 @@ class DicomTrachea3DPipeline:
             var idx = 0;
             var initialCam = null;
             var lookAhead = 3;
+            // 模式：0=腔外（外壁），1=腔内（翻面内壁），2=融合（外壁+翻面内壁）
+            // 需求：默认打开即为“融合模式”
+            var viewMode = 2;
+            // 兼容旧变量名：用于 headlight 是否启用
             var luminalOn = false;
             // 漫游：eye 始终在路径 pts[ii]；视线用 blendDir 在 rawFwd 上低通，减轻抖晃。
             // navFwdFollow：每帧朝 rawFwd 靠拢的比例；越大越贴真实折线/管腔走向（窄弯更准），顶点处方向跳变更明显→可能略抖。
             var navFwdFollow = 0.42;
             var navSmFwd = null;
             var navLastIi = null;
+            // lookDist：注视点距离上限（mm），防止“盯太远”导致穿帮/跳视
+            var navLookDistMax = 25.0;
+            // 冻结相机映射基准：避免某帧 axis range 变化导致 data->scene 映射跳变
+            var navCamBasis = null;
 
             function resetNavCameraSmooth() {
                 navSmFwd = null;
@@ -3580,6 +3695,22 @@ class DicomTrachea3DPipeline:
                 }
                 return null;
             }
+            function updateInnerWallHeadlight(gd, ex, ey, ez, cx, cy, cz) {
+                // 绑定“相机头灯”：让光源跟着相机走，减少腔内黑面
+                if (!gd || !gd.data) return;
+                var tiInner = traceIdxByName(gd, '气管内壁(腔内)');
+                if (tiInner == null) return;
+                var fx = cx - ex, fy = cy - ey, fz = cz - ez;
+                var fn = Math.sqrt(fx*fx + fy*fy + fz*fz);
+                if (fn < 1e-9) { fx = 0; fy = 0; fz = 1; fn = 1; }
+                fx /= fn; fy /= fn; fz /= fn;
+                // 第二轮实验：用“大尺度方向光”表达 headlight（Plotly mesh3d 对小尺度位置不敏感）
+                var L = 100000.0;
+                var lp = { x: fx * L, y: fy * L, z: fz * L };
+                try {
+                    Plotly.restyle(gd, { lightposition: lp }, [tiInner]);
+                } catch (e) {}
+            }
             function restyleVis(gd, ti, vis) {
                 if (ti == null || ti < 0) return;
                 Plotly.restyle(gd, { visible: vis }, [ti]);
@@ -3597,8 +3728,19 @@ class DicomTrachea3DPipeline:
                     if (tiG != null) Plotly.restyle(gd, { x: [[ex, cx]], y: [[ey, cy]], z: [[ez, cz]] }, [tiG]);
                 } catch (e) {}
             }
-            function applyLuminalMode(on) {
-                luminalOn = !!on;
+            function modeName(m) {
+                if (m === 1) return '腔内';
+                if (m === 2) return '融合';
+                return '腔外';
+            }
+            function applyViewMode(m) {
+                // 切换模式时强制暂停，避免“相机被定时器抢控”导致无法 look-around
+                stop();
+                viewMode = (m == null) ? 0 : (m | 0);
+                if (viewMode < 0) viewMode = 0;
+                if (viewMode > 2) viewMode = 2;
+                // 只要内壁可能参与显示，就启用 headlight
+                luminalOn = (viewMode !== 0);
                 var gd = getGd();
                 var st = document.getElementById('navLumState');
                 if (!gd || !gd.data) {
@@ -3608,23 +3750,28 @@ class DicomTrachea3DPipeline:
                 var bg = traceIdxByName(gd, '其他结构(半透明)');
                 var outer = traceIdxByName(gd, '气管区域(3D充气法)');
                 var inner = traceIdxByName(gd, '气管内壁(腔内)');
+                var innerFill = traceIdxByName(gd, '气管内壁(腔内-填充)');
                 var nav = traceIdxByName(gd, '导航线(插管路径)');
                 var cl = traceIdxByName(gd, '充气中心线');
                 var camM = traceIdxByName(gd, '相机位置(漫游)');
                 var tiGaze = traceIdxByName(gd, '视线(漫游)');
                 var tiAt = traceIdxByName(gd, '注视点(漫游)');
-                if (luminalOn) {
-                    restyleVis(gd, bg, false);
-                    restyleVis(gd, outer, false);
-                    if (inner != null) {
-                        restyleVis(gd, inner, true);
-                        Plotly.restyle(gd, { opacity: 0.58 }, [inner]);
-                    }
-                    restyleVis(gd, nav, true);
-                    restyleVis(gd, cl, true);
-                    if (camM != null) restyleVis(gd, camM, true);
-                    if (tiGaze != null) restyleVis(gd, tiGaze, true);
-                    if (tiAt != null) restyleVis(gd, tiAt, true);
+                // 关键：尽量避免切换时 set visible=true/false（会触发 Plotly 3D 场景重算，造成卡顿/交互异常）
+                // 改为：保持 trace 可见，仅通过 opacity≈0 来“隐藏”。
+                // 先确保这些层处于可见状态（仅第一次可能从 visible=false 拉起）
+                restyleVis(gd, bg, true);
+                restyleVis(gd, outer, true);
+                restyleVis(gd, inner, true);
+                restyleVis(gd, innerFill, true);
+
+                // opacity 约定：0.001 近似不可见，但不会引发 scene 重新定界/重映射
+                var OP_HIDE = 0.001;
+                if (viewMode === 1) {
+                    // 腔内：只显示内壁(+填充)
+                    if (bg != null)    { try { Plotly.restyle(gd, { opacity: OP_HIDE }, [bg]); } catch (e) {} }
+                    if (outer != null) { try { Plotly.restyle(gd, { opacity: OP_HIDE }, [outer]); } catch (e) {} }
+                    if (inner != null) { try { Plotly.restyle(gd, { opacity: 1.0 }, [inner]); } catch (e) {} }
+                    if (innerFill != null) { try { Plotly.restyle(gd, { opacity: 0.12 }, [innerFill]); } catch (e) {} }
                     if (nav != null) Plotly.restyle(gd, { 'line.width': 14, 'marker.size': 8 }, [nav]);
                     if (st) {
                         st.style.display = 'block';
@@ -3632,23 +3779,64 @@ class DicomTrachea3DPipeline:
                             ? '腔内模式：已显示反向法线内壁；外壁与背景已隐藏。'
                             : '腔内模式：未找到内壁图层（请用最新脚本重导 HTML）。';
                     }
-                } else {
-                    restyleVis(gd, bg, true);
-                    restyleVis(gd, outer, true);
-                    if (inner != null) {
-                        restyleVis(gd, inner, false);
-                        Plotly.restyle(gd, { opacity: 0.48 }, [inner]);
+                } else if (viewMode === 2) {
+                    // 融合：外壁 + 反向法线内壁同时显示（近似双面材质）
+                    if (bg != null)    { try { Plotly.restyle(gd, { opacity: 0.18 }, [bg]); } catch (e) {} }
+                    if (outer != null) { try { Plotly.restyle(gd, { opacity: 1.0 }, [outer]); } catch (e) {} }
+                    if (inner != null) { try { Plotly.restyle(gd, { opacity: 1.0 }, [inner]); } catch (e) {} }
+                    if (innerFill != null) { try { Plotly.restyle(gd, { opacity: OP_HIDE }, [innerFill]); } catch (e) {} }
+                    if (nav != null) Plotly.restyle(gd, { 'line.width': 10, 'marker.size': 6 }, [nav]);
+                    if (st) {
+                        st.style.display = 'block';
+                        st.textContent = '融合模式：外壁 + 反向法线内壁叠加显示（近似双面材质）。';
                     }
-                    restyleVis(gd, nav, true);
-                    restyleVis(gd, cl, true);
-                    if (camM != null) restyleVis(gd, camM, true);
-                    if (tiGaze != null) restyleVis(gd, tiGaze, true);
-                    if (tiAt != null) restyleVis(gd, tiAt, true);
+                } else {
+                    // 腔外：显示外壁 + 背景，隐藏内壁/填充
+                    if (bg != null)    { try { Plotly.restyle(gd, { opacity: 0.18 }, [bg]); } catch (e) {} }
+                    if (outer != null) { try { Plotly.restyle(gd, { opacity: 1.0 }, [outer]); } catch (e) {} }
+                    if (inner != null) { try { Plotly.restyle(gd, { opacity: OP_HIDE }, [inner]); } catch (e) {} }
+                    if (innerFill != null) { try { Plotly.restyle(gd, { opacity: OP_HIDE }, [innerFill]); } catch (e) {} }
                     if (nav != null) Plotly.restyle(gd, { 'line.width': 8, 'marker.size': 4 }, [nav]);
                     if (st) { st.style.display = 'none'; }
                 }
                 var b = document.getElementById('navLumToggle');
-                if (b) b.textContent = luminalOn ? '腔内模式：开（再点关闭）' : '腔内模式：关';
+                if (b) b.textContent = '模式：' + modeName(viewMode) + '（点击切换）';
+            }
+
+            function getThemeMap() {
+                // 深/浅成对色：外壁(深) + 内壁(浅) + 填充(更浅)
+                return {
+                    green: { outer: '#16a34a', inner: '#86efac', fill: '#d1fae5' },
+                    blue:  { outer: '#2563eb', inner: '#93c5fd', fill: '#dbeafe' },
+                    red:   { outer: '#dc2626', inner: '#fca5a5', fill: '#fee2e2' },
+                    beige: { outer: '#b45309', inner: '#fde68a', fill: '#fffbeb' },
+                    flesh: { outer: '#c2410c', inner: '#fdba74', fill: '#ffedd5' },
+                };
+            }
+            function applyTracheaTheme(themeKey) {
+                var gd = getGd();
+                if (!gd || !gd.data) return;
+                var mp = getThemeMap();
+                var th = mp[themeKey] || mp.green;
+                var outer = traceIdxByName(gd, '气管区域(3D充气法)');
+                var inner = traceIdxByName(gd, '气管内壁(腔内)');
+                var innerFill = traceIdxByName(gd, '气管内壁(腔内-填充)');
+                try {
+                    if (outer != null) Plotly.restyle(gd, { color: th.outer }, [outer]);
+                    if (inner != null) Plotly.restyle(gd, { color: th.inner }, [inner]);
+                    if (innerFill != null) Plotly.restyle(gd, { color: th.fill }, [innerFill]);
+                } catch (e) {}
+                try { localStorage.setItem('__TRACHEA_THEME__', String(themeKey || 'green')); } catch (e2) {}
+            }
+            function loadTheme() {
+                var sel = document.getElementById('navColorTheme');
+                var key = 'green';
+                try {
+                    var s = localStorage.getItem('__TRACHEA_THEME__');
+                    if (s) key = s;
+                } catch (e) {}
+                if (sel) sel.value = key;
+                applyTracheaTheme(key);
             }
 
             function pickUp(fx, fy, fz) {
@@ -3666,7 +3854,6 @@ class DicomTrachea3DPipeline:
                 if (l < 1e-12) return [0, 0, 1];
                 return [v[0]/l, v[1]/l, v[2]/l];
             }
-
             function tangentForward(pts, ii) {
                 var n = pts.length;
                 if (n < 2) return [0, 0, 1];
@@ -3813,53 +4000,13 @@ class DicomTrachea3DPipeline:
                 return getSceneCamBasisFromTraces(gd);
             }
 
-            function applyCameraForIndex(pts, i, skipRelayout) {
-                var gd = getGd();
-                if (!gd || !pts || pts.length < 2) return;
-                var n = pts.length;
-                var ii = Math.max(0, Math.min(n - 1, i | 0));
-                var step = meanStep(pts);
-                var lookLen = Math.max(step * 2.5, 1.2);
-                var lookSegs = 3;
-                var j = Math.min(n - 1, ii + lookSegs);
-                var rawEx = pts[ii][0];
-                var rawEy = pts[ii][1];
-                var rawEz = pts[ii][2];
-                var tx = pts[j][0];
-                var ty = pts[j][1];
-                var tz = pts[j][2];
-                var rdx = tx - rawEx;
-                var rdy = ty - rawEy;
-                var rdz = tz - rawEz;
-                var rdist = Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
-                if (rdist < 1e-4) {
-                    var fwb = tangentSmoothed(pts, Math.max(0, ii - 1), 8);
-                    tx = rawEx + fwb[0] * lookLen;
-                    ty = rawEy + fwb[1] * lookLen;
-                    tz = rawEz + fwb[2] * lookLen;
-                    rdx = tx - rawEx;
-                    rdy = ty - rawEy;
-                    rdz = tz - rawEz;
-                }
-                var rawFwd = norm3([tx - rawEx, ty - rawEy, tz - rawEz]);
-                var jump = (navLastIi == null || Math.abs(ii - navLastIi) > 2);
-                if (navSmFwd == null || jump) {
-                    navSmFwd = rawFwd.slice();
-                } else {
-                    navSmFwd = blendDir(navSmFwd, rawFwd, navFwdFollow);
-                }
-                navLastIi = ii;
-                var ex = rawEx;
-                var ey = rawEy;
-                var ez = rawEz;
-                var lookDist = Math.max(step * 3.5, 2.0);
-                var cx = ex + navSmFwd[0] * lookDist;
-                var cy = ey + navSmFwd[1] * lookDist;
-                var cz = ez + navSmFwd[2] * lookDist;
+            function applyCameraToGd(gd, ex, ey, ez, cx, cy, cz, skipRelayout) {
+                if (!gd) return;
                 updateNavDebugOverlays(gd, ex, ey, ez, cx, cy, cz);
                 if (skipRelayout) return;
-                var b = getSceneCamBasisAny(gd);
+                var b = navCamBasis || getSceneCamBasisAny(gd);
                 if (!b) return;
+                if (!navCamBasis) navCamBasis = b;
                 var eyeC = dataPointToSceneCam([ex, ey, ez], b);
                 var centerC = dataPointToSceneCam([cx, cy, cz], b);
                 if (!eyeC || !centerC) return;
@@ -3878,6 +4025,68 @@ class DicomTrachea3DPipeline:
                     }
                 } catch (ep) {}
                 relayoutSceneCameraPatch(gd, patch);
+                // 腔内模式下：动态 headlight（随相机更新）
+                if (luminalOn) {
+                    updateInnerWallHeadlight(gd, ex, ey, ez, cx, cy, cz);
+                }
+            }
+
+            function applyCameraForIndex(pts, i, skipRelayout) {
+                var gd = getGd();
+                if (!gd || !pts || pts.length < 2) return;
+                var cam = getCam();
+                var n = pts.length;
+                var ii = Math.max(0, Math.min(n - 1, i | 0));
+                var step = meanStep(pts);
+                var lookLen = Math.max(step * 2.5, 1.2);
+                var lookSegs = 3;
+                var j = Math.min(n - 1, ii + lookSegs);
+                var rawEx = pts[ii][0];
+                var rawEy = pts[ii][1];
+                var rawEz = pts[ii][2];
+                var rawFwd = null;
+                var preLook = null;
+                if (cam && cam.fwd && cam.lookDist && cam.fwd.length > ii && cam.lookDist.length > ii) {
+                    // 射线约束看向（离线预计算）：优先使用 cam.fwd/lookDist
+                    rawFwd = norm3(cam.fwd[ii]);
+                    preLook = cam.lookDist[ii];
+                } else {
+                    // 回退：前方第 lookSegs 个顶点作为注视方向
+                    var tx = pts[j][0];
+                    var ty = pts[j][1];
+                    var tz = pts[j][2];
+                    var rdx = tx - rawEx;
+                    var rdy = ty - rawEy;
+                    var rdz = tz - rawEz;
+                    var rdist = Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+                    if (rdist < 1e-4) {
+                        var fwb = tangentSmoothed(pts, Math.max(0, ii - 1), 8);
+                        tx = rawEx + fwb[0] * lookLen;
+                        ty = rawEy + fwb[1] * lookLen;
+                        tz = rawEz + fwb[2] * lookLen;
+                    }
+                    rawFwd = norm3([tx - rawEx, ty - rawEy, tz - rawEz]);
+                }
+                var jump = (navLastIi == null || Math.abs(ii - navLastIi) > 2);
+                if (navSmFwd == null || jump) {
+                    navSmFwd = rawFwd.slice();
+                } else {
+                    navSmFwd = blendDir(navSmFwd, rawFwd, navFwdFollow);
+                }
+                navLastIi = ii;
+                var ex = rawEx;
+                var ey = rawEy;
+                var ez = rawEz;
+                var lookDist = (preLook != null && isFinite(preLook)) ? Number(preLook) : Math.max(step * 3.5, 2.0);
+                // clamp：避免单帧 lookDist 异常偏大把注视点拉到腔外方向
+                lookDist = Math.max(1.0, lookDist);
+                if (isFinite(navLookDistMax) && navLookDistMax > 1.0) {
+                    lookDist = Math.min(lookDist, navLookDistMax);
+                }
+                var cx = ex + navSmFwd[0] * lookDist;
+                var cy = ey + navSmFwd[1] * lookDist;
+                var cz = ez + navSmFwd[2] * lookDist;
+                applyCameraToGd(gd, ex, ey, ez, cx, cy, cz, skipRelayout);
             }
 
             function syncPathUi(pts, i) {
@@ -3899,6 +4108,13 @@ class DicomTrachea3DPipeline:
                     var z = pts[ii][2];
                     zLbl.textContent = (z != null && isFinite(z)) ? Number(z).toFixed(1) : '—';
                 }
+                // 同步切片：导航帧的 z_mm -> 最近切片（不是一一对应，取最近邻）
+                try {
+                    var z2 = pts[ii][2];
+                    if (z2 != null && isFinite(z2) && window.__setSliceNearZmm__) {
+                        window.__setSliceNearZmm__(Number(z2));
+                    }
+                } catch (e) {}
             }
 
             function stop() {
@@ -3975,13 +4191,23 @@ class DicomTrachea3DPipeline:
                     });
                 }
                 var lumBtn = document.getElementById('navLumToggle');
-                if (lumBtn) lumBtn.addEventListener('click', function() { applyLuminalMode(!luminalOn); });
+                if (lumBtn) lumBtn.addEventListener('click', function() { applyViewMode((viewMode + 1) % 3); });
+                var themeSel = document.getElementById('navColorTheme');
+                if (themeSel) themeSel.addEventListener('change', function() {
+                    // 用户交互：切换配色 → 暂停播放，避免定时器抢控
+                    stop();
+                    applyTracheaTheme(themeSel.value);
+                });
             }
 
             function captureInitial() {
                 var gd = getGd();
                 if (!gd || !gd.layout || !gd.layout.scene || !gd.layout.scene.camera) return;
                 if (!initialCam) initialCam = cloneCam(gd.layout.scene.camera);
+                // 首次捕获时冻结 basis（后续每帧不再重算）
+                if (!navCamBasis) {
+                    try { navCamBasis = getSceneCamBasisAny(gd); } catch (e) {}
+                }
             }
 
             function boot() {
@@ -4000,6 +4226,7 @@ class DicomTrachea3DPipeline:
                         forceSceneRedraw(getGd());
                     }
                 }
+
                 if (gd && gd.on) {
                     gd.on('plotly_afterplot', onAfter);
                 }
@@ -4011,6 +4238,12 @@ class DicomTrachea3DPipeline:
                     if (g2 && p2 && p2.length) applyCameraForIndex(p2, 0, true);
                 }, 300);
                 wire();
+                // 初始化模式 UI（默认：腔外）
+                applyViewMode(viewMode);
+                // 载入配色主题
+                loadTheme();
+                // 对外暴露：切片浏览器等交互触发时暂停播放
+                try { window.__NAV_CAM_STOP__ = stop; } catch (e) {}
             }
 
             if (document.readyState === 'loading') {
@@ -4055,22 +4288,26 @@ class DicomTrachea3DPipeline:
         
         # 生成HTML和JavaScript
         html = f"""
-        <div id="slicePanel" style="position:fixed;top:20px;right:20px;background:#fff;padding:15px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.15);z-index:9999;width:280px;font-family:system-ui,-apple-system,sans-serif;">
-            <h3 style="margin:0 0 12px;font-size:16px;color:#333;">切片浏览器</h3>
+        <div id="slicePanel" style="position:static;background:#0b1220;color:#e5e7eb;padding:10px 12px;border-radius:12px;border:1px solid #334155;box-shadow:none;z-index:auto;width:100%;font-family:system-ui,-apple-system,sans-serif;">
+            <div style="margin:0 0 8px;font-size:13px;font-weight:750;color:#fff;letter-spacing:0.2px;">切片浏览器</div>
             <div style="margin-bottom:12px;">
                 <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                    <span style="font-size:13px;color:#666;">切片 #<b id="zIdx">{initial_z_idx}</b></span>
-                    <span style="font-size:13px;color:#666;">Z: <b id="zMm">{initial_slice['z_mm']}</b>mm</span>
+                    <span style="font-size:12px;color:#cbd5e1;">切片 #<b id="zIdx" style="color:#fff;">{initial_z_idx}</b></span>
+                    <span style="font-size:12px;color:#cbd5e1;">Z: <b id="zMm" style="color:#fff;">{initial_slice['z_mm']}</b>mm</span>
                 </div>
                 <input type="range" id="slider" min="0" max="{len(slice_list)-1}" value="{initial_array_index}" style="width:100%;margin:8px 0;">
                 <div style="display:flex;gap:8px;margin-top:8px;">
-                    <button id="btnPrev" style="flex:1;padding:6px;border:1px solid #ddd;background:#f8f9fa;border-radius:4px;cursor:pointer;font-size:12px;">← 上一个</button>
-                    <button id="btnNext" style="flex:1;padding:6px;border:1px solid #ddd;background:#f8f9fa;border-radius:4px;cursor:pointer;font-size:12px;">下一个 →</button>
+                    <button id="btnPrev" style="flex:1;padding:6px 8px;border:1px solid #334155;background:#111827;color:#e5e7eb;border-radius:8px;cursor:pointer;font-size:12px;">← 上一个</button>
+                    <button id="btnNext" style="flex:1;padding:6px 8px;border:1px solid #334155;background:#111827;color:#e5e7eb;border-radius:8px;cursor:pointer;font-size:12px;">下一个 →</button>
                 </div>
+                <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:#cbd5e1;user-select:none;">
+                    <input type="checkbox" id="toggleCT" checked />
+                    显示 CT 图像平面（3D 叠加）
+                </label>
             </div>
-            <div style="background:#f8f9fa;padding:10px;border-radius:4px;font-size:12px;">
-                <div style="margin-bottom:4px;">面积: <b id="area">-</b> px</div>
-                <div>Z物理: <b id="zMm2">-</b> mm</div>
+            <div style="background:#0f172a;padding:10px;border-radius:10px;border:1px solid #334155;font-size:12px;">
+                <div style="margin-bottom:4px;color:#cbd5e1;">面积: <b id="area" style="color:#fff;">-</b> px</div>
+                <div style="color:#cbd5e1;">Z物理: <b id="zMm2" style="color:#fff;">-</b> mm</div>
             </div>
         </div>
         
@@ -4078,6 +4315,8 @@ class DicomTrachea3DPipeline:
         (function() {{
             // 切片数据（简化版）
             const SLICES = {json.dumps(slice_list)};
+            // 暴露给导航面板：用于“按 z_mm 找最近切片”
+            window.__CT_SLICES__ = SLICES;
             const INITIAL_Z = {initial_z_idx};
             const INITIAL_ARRAY_INDEX = {initial_array_index};
             
@@ -4089,9 +4328,11 @@ class DicomTrachea3DPipeline:
             const zMm2 = document.getElementById('zMm2');
             const btnPrev = document.getElementById('btnPrev');
             const btnNext = document.getElementById('btnNext');
+            const toggleCT = document.getElementById('toggleCT');
             
             let currentArrayIndex = 0;
             let plotlyReady = false;
+            let showCTPlane = true;
             
             // 更新UI和3D视图
             function showSlice(arrayIndex) {{
@@ -4119,8 +4360,11 @@ class DicomTrachea3DPipeline:
                 const currentSliceDiv = document.getElementById('slice-analysis-' + slice.z_idx);
                 if (currentSliceDiv) {{
                     currentSliceDiv.style.display = 'block';
-                    // 滚动到该切片位置
-                    currentSliceDiv.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                    // 默认交互：滚动到该切片位置
+                    // 若来自导航同步（__NAV_SYNCING__），则不滚动，避免造成卡顿与视角交互被打断
+                    if (!window.__NAV_SYNCING__) {{
+                        currentSliceDiv.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                    }}
                 }}
                 
                 // 更新Plotly可见性
@@ -4135,10 +4379,55 @@ class DicomTrachea3DPipeline:
                         return trace.visible; // 保持原状
                     }}
                     const match = trace.name.match(/切片 Z=(\\d+)/);
-                    return match ? (parseInt(match[1]) === slice.z_idx) : false;
+                    const isThisSlice = match ? (parseInt(match[1]) === slice.z_idx) : false;
+                    return isThisSlice;
                 }});
-                
-                Plotly.restyle(gd, {{'visible': visibility}});
+
+                // CT 平面开关：不要把 trace 设为不可见（会触发坐标范围/axis range 重算）
+                // 仅通过 opacity 做“几乎不可见”，以保持 scene 范围稳定。
+                const ctHideOpacity = 0.001;
+                const ctShowOpacity = 0.30;
+                const opacityArr = gd.data.map(trace => {{
+                    if (trace && trace.name && trace.name.includes('CT图像平面')) {{
+                        return showCTPlane ? ctShowOpacity : ctHideOpacity;
+                    }}
+                    return (trace && trace.opacity != null) ? trace.opacity : 1.0;
+                }});
+
+                Plotly.restyle(gd, {{'visible': visibility, 'opacity': opacityArr}});
+            }}
+
+            function nearestSliceIndexByZmm(zmm) {{
+                if (!isFinite(zmm) || !SLICES || !SLICES.length) return null;
+                let bestI = 0;
+                let bestD = Infinity;
+                for (let i = 0; i < SLICES.length; i++) {{
+                    const dz = Math.abs(Number(SLICES[i].z_mm) - Number(zmm));
+                    if (dz < bestD) {{ bestD = dz; bestI = i; }}
+                }}
+                return bestI;
+            }}
+
+            // 供导航面板调用：按 z_mm 同步到最近切片
+            window.__setSliceNearZmm__ = function(zmm) {{
+                let prev = window.__NAV_SYNCING__;
+                try {{
+                    const i = nearestSliceIndexByZmm(zmm);
+                    if (i == null) return;
+                    window.__NAV_SYNCING__ = true;
+                    showSlice(i);
+                }} finally {{
+                    window.__NAV_SYNCING__ = prev;
+                }}
+            }};
+
+            // 把切片面板“合并”到导航面板里（若存在挂载点）
+            function tryMountIntoNav() {{
+                const mount = document.getElementById('navSliceMount');
+                const panel = document.getElementById('slicePanel');
+                if (mount && panel && panel.parentElement !== mount) {{
+                    mount.appendChild(panel);
+                }}
             }}
             
             // 查找初始切片的数组索引
@@ -4149,10 +4438,25 @@ class DicomTrachea3DPipeline:
                 return Math.floor(SLICES.length / 2);
             }}
             
-            // 事件绑定
-            slider.addEventListener('input', () => showSlice(parseInt(slider.value)));
-            btnPrev.addEventListener('click', () => showSlice(currentArrayIndex - 1));
-            btnNext.addEventListener('click', () => showSlice(currentArrayIndex + 1));
+            function pauseNavIfAny() {{
+                try {{
+                    if (window.__NAV_CAM_STOP__ && typeof window.__NAV_CAM_STOP__ === 'function') {{
+                        window.__NAV_CAM_STOP__();
+                    }}
+                }} catch (e) {{}}
+            }}
+
+            // 事件绑定（用户交互：暂停导航播放，避免状态竞争）
+            slider.addEventListener('input', () => {{ pauseNavIfAny(); showSlice(parseInt(slider.value)); }});
+            btnPrev.addEventListener('click', () => {{ pauseNavIfAny(); showSlice(currentArrayIndex - 1); }});
+            btnNext.addEventListener('click', () => {{ pauseNavIfAny(); showSlice(currentArrayIndex + 1); }});
+            if (toggleCT) {{
+                toggleCT.addEventListener('change', () => {{
+                    pauseNavIfAny();
+                    showCTPlane = !!toggleCT.checked;
+                    showSlice(currentArrayIndex);
+                }});
+            }}
             
             // 键盘快捷键
             document.addEventListener('keydown', e => {{
@@ -4165,6 +4469,8 @@ class DicomTrachea3DPipeline:
                 const gd = document.querySelector('.plotly-graph-div');
                 if (gd && gd.data && gd.data.length > 0) {{
                     plotlyReady = true;
+                    // 合并面板：把切片浏览器挂载到导航面板（若存在）
+                    tryMountIntoNav();
                     showSlice(INITIAL_ARRAY_INDEX);
                     console.log('✓ 切片选择器已初始化:', SLICES.length, '个切片');
                 }} else {{
