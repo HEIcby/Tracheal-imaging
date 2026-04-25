@@ -90,6 +90,9 @@ class DicomTrachea3DPipeline:
         # 导航线（从3D掩码计算；用于插管路径/相机漫游）
         self.navigation_path_plotly = None  # (N,3): x_ds, y_ds, z_mm
         self.navigation_path_voxel = None   # (N,3): z_idx, y_roi, x_roi（ROI原始分辨率）
+        # 多算法对比时用于叠加绘制（不影响默认漫游逻辑）
+        self.navigation_paths_plotly = {}   # {alg_name: (N,3)}
+        self.navigation_paths_voxel = {}    # {alg_name: (N,3)}
         self.navigation_meta = {}
 
     def _estimate_spacing_mm(self):
@@ -193,6 +196,8 @@ class DicomTrachea3DPipeline:
     def _compute_navigation_path_from_mask(
         self,
         *,
+        algorithm: str = "skeleton_dijkstra",
+        compare_algorithms: bool = False,
         min_turn_radius_mm: float = 12.0,
         resample_step_mm: float = 1.0,
         wall_bias_power: float = 1.5,
@@ -205,6 +210,7 @@ class DicomTrachea3DPipeline:
         输出：
           - self.navigation_path_voxel: (N,3) z_idx,y_roi,x_roi（ROI原始分辨率）
           - self.navigation_path_plotly: (N,3) x_ds,y_ds,z_mm（与HTML一致坐标系）
+          - self.navigation_paths_plotly: {alg: (N,3)}（若 compare_algorithms=True）
         """
         if self.trachea_mask_3d is None or self.slices_data is None or len(self.slices_data) == 0:
             return False
@@ -219,38 +225,18 @@ class DicomTrachea3DPipeline:
         from scipy.ndimage import distance_transform_edt
         dist_mm = distance_transform_edt(mask, sampling=(dz_mm, dy_mm, dx_mm)).astype(np.float32)
 
-        # 骨架（细化）作为可搜索的中心候选集
-        print("\n计算导航线：3D骨架化 + 路径搜索...")
-        try:
-            # scikit-image < 0.20
-            from skimage.morphology import skeletonize_3d as _skel3d  # type: ignore
-            skel = _skel3d(mask).astype(bool)
-        except Exception:
-            try:
-                # scikit-image >= 0.20：skeletonize 支持 nD（含 3D）
-                from skimage.morphology import skeletonize
-                skel = skeletonize(mask.astype(bool)).astype(bool)
-            except Exception as e:
-                print(f"  ✗ 3D骨架化不可用: {e}")
-                return False
-        skel_count = int(np.sum(skel))
-        print(f"  骨架体素: {skel_count:,}")
-        if skel_count < 50:
-            print("  ✗ 骨架体素过少，跳过导航线")
-            return False
-
         # 起终点：沿堆叠方向，从“物理Z较大端(zmax/头侧)”与“物理Z较小端(zmin/足侧)”
         # 各自向内找到第一个仍有掩码的切片（充气结果常在两端若干层为空，不能硬用0/N-1）
-        zN = mask.shape[0]
+        zN = int(mask.shape[0])
 
         def pick_best_voxel_at_slice(z_idx: int):
-            m = mask[z_idx]
+            m = mask[int(z_idx)]
             if not np.any(m):
                 return None
-            d = dist_mm[z_idx].copy()
+            d = dist_mm[int(z_idx)].copy()
             d[~m] = -1.0
             yx = np.unravel_index(int(np.argmax(d)), d.shape)
-            return (z_idx, int(yx[0]), int(yx[1]))
+            return (int(z_idx), int(yx[0]), int(yx[1]))
 
         z_start = None
         for z_idx in range(zN - 1, -1, -1):
@@ -273,165 +259,289 @@ class DicomTrachea3DPipeline:
             print("  ✗ 起点或终点切片没有有效掩码体素")
             return False
 
-        start = self._find_nearest_skeleton_voxel(start_guess, skel) or start_guess
-        goal = self._find_nearest_skeleton_voxel(goal_guess, skel) or goal_guess
+        def compute_one(alg_name: str):
+            alg_name = (alg_name or "").strip().lower()
 
-        # Dijkstra on skeleton voxels
-        import heapq
-        zN, yN, xN = mask.shape
+            if alg_name in ("skeleton", "skeleton_dijkstra", "dijkstra"):
+                # 骨架（细化）作为可搜索的中心候选集
+                print("\n计算导航线：3D骨架化 + Dijkstra(skeleton)...")
+                try:
+                    # scikit-image < 0.20
+                    from skimage.morphology import skeletonize_3d as _skel3d  # type: ignore
+                    skel = _skel3d(mask).astype(bool)
+                except Exception:
+                    try:
+                        # scikit-image >= 0.20：skeletonize 支持 nD（含 3D）
+                        from skimage.morphology import skeletonize
+                        skel = skeletonize(mask.astype(bool)).astype(bool)
+                    except Exception as e:
+                        print(f"  ✗ 3D骨架化不可用: {e}")
+                        return None
+                skel_count = int(np.sum(skel))
+                print(f"  骨架体素: {skel_count:,}")
+                if skel_count < 50:
+                    print("  ✗ 骨架体素过少，跳过导航线")
+                    return None
 
-        def lin(zyx):
-            z, y, x = zyx
-            return (z * yN + y) * xN + x
+                start = self._find_nearest_skeleton_voxel(start_guess, skel) or start_guess
+                goal = self._find_nearest_skeleton_voxel(goal_guess, skel) or goal_guess
 
-        start_l = lin(start)
-        goal_l = lin(goal)
+                # Dijkstra on skeleton voxels
+                import heapq
+                zN2, yN, xN = mask.shape
 
-        offsets = []
-        for oz in (-1, 0, 1):
-            for oy in (-1, 0, 1):
-                for ox in (-1, 0, 1):
-                    if oz == 0 and oy == 0 and ox == 0:
+                def lin(zyx):
+                    z, y, x = zyx
+                    return (z * yN + y) * xN + x
+
+                start_l = lin(start)
+                goal_l = lin(goal)
+
+                offsets = []
+                for oz in (-1, 0, 1):
+                    for oy in (-1, 0, 1):
+                        for ox in (-1, 0, 1):
+                            if oz == 0 and oy == 0 and ox == 0:
+                                continue
+                            offsets.append((oz, oy, ox))
+
+                def step_len_mm(oz, oy, ox):
+                    return float(np.sqrt((oz * dz_mm) ** 2 + (oy * dy_mm) ** 2 + (ox * dx_mm) ** 2))
+
+                heap = [(0.0, start_l)]
+                dist = {start_l: 0.0}
+                parent = {start_l: None}
+                visited = 0
+
+                while heap:
+                    cur_d, cur_l = heapq.heappop(heap)
+                    if cur_l == goal_l:
+                        break
+                    if cur_d != dist.get(cur_l, None):
                         continue
-                    offsets.append((oz, oy, ox))
+                    visited += 1
+                    # 解码
+                    z = cur_l // (yN * xN)
+                    rem = cur_l - z * (yN * xN)
+                    y = rem // xN
+                    x = rem - y * xN
+                    for oz, oy, ox in offsets:
+                        nz, ny, nx = z + oz, y + oy, x + ox
+                        if not (0 <= nz < zN2 and 0 <= ny < yN and 0 <= nx < xN):
+                            continue
+                        if not skel[nz, ny, nx]:
+                            continue
+                        wall_d = float(dist_mm[nz, ny, nx])
+                        # dist很小时给大惩罚，迫使路径远离壁
+                        cost = step_len_mm(oz, oy, ox) * (1.0 / (wall_d + 1e-3)) ** float(wall_bias_power)
+                        nl = (nz * yN + ny) * xN + nx
+                        nd = cur_d + cost
+                        if nd < dist.get(nl, float("inf")):
+                            dist[nl] = nd
+                            parent[nl] = cur_l
+                            heapq.heappush(heap, (nd, nl))
 
-        def step_len_mm(oz, oy, ox):
-            return float(np.sqrt((oz * dz_mm) ** 2 + (oy * dy_mm) ** 2 + (ox * dx_mm) ** 2))
+                if goal_l not in parent:
+                    print("  ✗ 骨架上未找到连通路径（可能骨架断裂）")
+                    return None
 
-        heap = [(0.0, start_l)]
-        dist = {start_l: 0.0}
-        parent = {start_l: None}
-        visited = 0
+                # 回溯路径
+                path_l = []
+                cur = goal_l
+                while cur is not None:
+                    path_l.append(cur)
+                    cur = parent[cur]
+                path_l.reverse()
 
-        while heap:
-            cur_d, cur_l = heapq.heappop(heap)
-            if cur_l == goal_l:
-                break
-            if cur_d != dist.get(cur_l, None):
+                path_zyx = np.zeros((len(path_l), 3), dtype=np.int32)
+                for i, ll in enumerate(path_l):
+                    z = ll // (yN * xN)
+                    rem = ll - z * (yN * xN)
+                    y = rem // xN
+                    x = rem - y * xN
+                    path_zyx[i] = (z, y, x)
+
+                print(f"  骨架路径长度: {len(path_zyx)}点（visited={visited:,}）")
+                return path_zyx
+
+            if alg_name in ("dt_ridge", "dist_ridge", "distance_ridge", "dt"):
+                print("\n计算导航线：DT ridge（逐切片取距壁最大点）...")
+                pts = []
+                for z_idx in range(int(z_start), int(z_goal) - 1, -1):
+                    v = pick_best_voxel_at_slice(int(z_idx))
+                    if v is None:
+                        continue
+                    pts.append(v)
+                if len(pts) < 3:
+                    print("  ✗ DT ridge 路径点过少")
+                    return None
+                return np.asarray(pts, dtype=np.int32)
+
+            print(f"  ✗ 未知导航算法: {alg_name}")
+            return None
+
+        # 选择需要计算的算法列表
+        if compare_algorithms:
+            algs = ["skeleton_dijkstra", "dt_ridge"]
+        else:
+            algs = [algorithm or "skeleton_dijkstra"]
+
+        paths_voxel = {}
+        paths_plotly = {}
+        metrics_by_alg = {}
+
+        for alg in algs:
+            path_zyx = compute_one(str(alg))
+            if path_zyx is None or len(path_zyx) < 3:
                 continue
-            visited += 1
-            # 解码
-            z = cur_l // (yN * xN)
-            rem = cur_l - z * (yN * xN)
-            y = rem // xN
-            x = rem - y * xN
-            for oz, oy, ox in offsets:
-                nz, ny, nx = z + oz, y + oy, x + ox
-                if not (0 <= nz < zN and 0 <= ny < yN and 0 <= nx < xN):
-                    continue
-                if not skel[nz, ny, nx]:
-                    continue
-                wall_d = float(dist_mm[nz, ny, nx])
-                # dist很小时给大惩罚，迫使路径远离壁
-                cost = step_len_mm(oz, oy, ox) * (1.0 / (wall_d + 1e-3)) ** float(wall_bias_power)
-                nl = (nz * yN + ny) * xN + nx
-                nd = cur_d + cost
-                if nd < dist.get(nl, float("inf")):
-                    dist[nl] = nd
-                    parent[nl] = cur_l
-                    heapq.heappush(heap, (nd, nl))
 
-        if goal_l not in parent:
-            print("  ✗ 骨架上未找到连通路径（可能骨架断裂）")
+            # 转为物理坐标(mm)用于平滑与转弯半径约束
+            x1_orig, y1_orig = self.roi_offset  # 原始分辨率ROI偏移
+            row_mm, col_mm = dy_mm, dx_mm
+            pts_mm = np.zeros((len(path_zyx), 3), dtype=np.float64)
+            for i, (z_idx, y_roi, x_roi) in enumerate(path_zyx):
+                z_mm = float(self.slices_data[int(z_idx)][0])
+                x_orig = float(int(x_roi) + int(x1_orig))
+                y_orig = float(int(y_roi) + int(y1_orig))
+                pts_mm[i] = (x_orig * col_mm, y_orig * row_mm, z_mm)
+
+            # 重采样 + 样条平滑，尽量满足最小转弯半径
+            pts_mm = self._resample_polyline_by_step(pts_mm, resample_step_mm)
+            best_mm = pts_mm
+            best_r = self._polyline_min_turn_radius_mm(best_mm)
+
+            if len(pts_mm) >= 4:
+                for it in range(max_smoothing_iters):
+                    try:
+                        s_val = float((it + 1) * 5.0)
+                        tck, _ = splprep([pts_mm[:, 0], pts_mm[:, 1], pts_mm[:, 2]], s=s_val, k=3)
+                        u = np.linspace(0.0, 1.0, len(pts_mm))
+                        x_s, y_s, z_s = splev(u, tck)
+                        sm = np.stack([x_s, y_s, z_s], axis=1)
+                        sm = self._resample_polyline_by_step(sm, resample_step_mm)
+                        r = self._polyline_min_turn_radius_mm(sm)
+                        if r > best_r:
+                            best_r = r
+                            best_mm = sm
+                        if r >= float(min_turn_radius_mm):
+                            best_mm = sm
+                            best_r = r
+                            break
+                    except Exception:
+                        break
+
+            # 沿路径索引轻平滑：减轻漫游“抖动/贴壁感”
+            try:
+                from scipy.ndimage import gaussian_filter1d
+                sig = 1.15
+                for d in range(3):
+                    best_mm[:, d] = gaussian_filter1d(best_mm[:, d], sigma=sig, mode="nearest")
+                best_mm = self._resample_polyline_by_step(best_mm, resample_step_mm)
+                best_r = self._polyline_min_turn_radius_mm(best_mm)
+            except Exception:
+                pass
+
+            # Plotly 坐标系（x_ds,y_ds,z_mm）
+            scale_factor = self.downsample_size / self.original_size[0]
+            x_ds = (best_mm[:, 0] / col_mm) * scale_factor
+            y_ds = (best_mm[:, 1] / row_mm) * scale_factor
+            z_mm_arr = best_mm[:, 2]
+            nav_plotly = np.stack([x_ds, y_ds, z_mm_arr], axis=1).astype(np.float32)
+
+            # voxel路径：z_idx 最近切片匹配
+            z_positions = np.array([float(z) for z, _, _ in self.slices_data], dtype=np.float64)
+            voxel_path = np.zeros((len(best_mm), 3), dtype=np.int32)
+            for i in range(len(best_mm)):
+                z_idx = int(np.argmin(np.abs(z_positions - float(best_mm[i, 2]))))
+                x_orig = int(round(float(best_mm[i, 0]) / col_mm))
+                y_orig = int(round(float(best_mm[i, 1]) / row_mm))
+                voxel_path[i, 0] = z_idx
+                voxel_path[i, 1] = int(y_orig - int(y1_orig))
+                voxel_path[i, 2] = int(x_orig - int(x1_orig))
+
+            # 指标工程化
+            path_len_mm = 0.0
+            try:
+                seg = np.diff(best_mm.astype(np.float64), axis=0)
+                path_len_mm = float(np.sum(np.linalg.norm(seg, axis=1)))
+            except Exception:
+                path_len_mm = 0.0
+
+            wall_d = []
+            try:
+                for z_idx, y_roi, x_roi in voxel_path.tolist():
+                    z_idx = int(z_idx)
+                    y_roi = int(y_roi)
+                    x_roi = int(x_roi)
+                    if (
+                        0 <= z_idx < int(dist_mm.shape[0])
+                        and 0 <= y_roi < int(dist_mm.shape[1])
+                        and 0 <= x_roi < int(dist_mm.shape[2])
+                    ):
+                        if mask[z_idx, y_roi, x_roi]:
+                            v = float(dist_mm[z_idx, y_roi, x_roi])
+                            if np.isfinite(v):
+                                wall_d.append(v)
+            except Exception:
+                wall_d = []
+
+            wall_stats = None
+            if wall_d:
+                arr = np.asarray(wall_d, dtype=np.float64)
+                wall_stats = {
+                    "d_min": float(np.min(arr)),
+                    "d_p05": float(np.percentile(arr, 5)),
+                    "d_med": float(np.median(arr)),
+                    "d_mean": float(np.mean(arr)),
+                }
+
+            metrics_by_alg[str(alg)] = {
+                "algorithm": str(alg),
+                "min_turn_radius_mm_target": float(min_turn_radius_mm),
+                "min_turn_radius_mm_estimated": float(best_r if np.isfinite(best_r) else 0.0),
+                "path_length_mm": float(path_len_mm),
+                "wall_dist_mm": wall_stats,
+                "resample_step_mm": float(resample_step_mm),
+                "wall_bias_power": float(wall_bias_power),
+                "spacing_mm": {"dz": float(dz_mm), "dy": float(dy_mm), "dx": float(dx_mm)},
+                "direction": "zmax_to_zmin",
+            }
+
+            paths_voxel[str(alg)] = voxel_path
+            paths_plotly[str(alg)] = nav_plotly
+
+        if not metrics_by_alg:
             return False
 
-        # 回溯路径
-        path_l = []
-        cur = goal_l
-        while cur is not None:
-            path_l.append(cur)
-            cur = parent[cur]
-        path_l.reverse()
+        # 选一个“主导航线”供漫游/默认展示：优先 p05，其次 Rmin，最后偏短
+        def score(m: dict):
+            wd = (m or {}).get("wall_dist_mm") or {}
+            p05 = wd.get("d_p05", None)
+            rmin = m.get("min_turn_radius_mm_estimated", None)
+            Lmm = m.get("path_length_mm", None)
+            p05v = float(p05) if p05 is not None else -1.0
+            rminv = float(rmin) if rmin is not None else -1.0
+            Lvv = float(Lmm) if Lmm is not None else 1e18
+            return (p05v, rminv, -Lvv)
 
-        path_zyx = np.zeros((len(path_l), 3), dtype=np.int32)
-        for i, ll in enumerate(path_l):
-            z = ll // (yN * xN)
-            rem = ll - z * (yN * xN)
-            y = rem // xN
-            x = rem - y * xN
-            path_zyx[i] = (z, y, x)
+        selected_alg = max(metrics_by_alg.keys(), key=lambda k: score(metrics_by_alg[k]))
 
-        print(f"  骨架路径长度: {len(path_zyx)}点（visited={visited:,}）")
+        self.navigation_paths_plotly = paths_plotly
+        self.navigation_paths_voxel = paths_voxel
+        self.navigation_path_plotly = paths_plotly.get(selected_alg)
+        self.navigation_path_voxel = paths_voxel.get(selected_alg)
 
-        # 转为物理坐标(mm)用于平滑与转弯半径约束
-        # ROI内像素坐标 -> 原始全局像素坐标 -> mm
-        x1_orig, y1_orig = self.roi_offset  # 原始分辨率ROI偏移
-        row_mm, col_mm = dy_mm, dx_mm
-        pts_mm = np.zeros((len(path_zyx), 3), dtype=np.float64)
-        for i, (z_idx, y_roi, x_roi) in enumerate(path_zyx):
-            z_mm = float(self.slices_data[int(z_idx)][0])
-            x_orig = float(int(x_roi) + int(x1_orig))
-            y_orig = float(int(y_roi) + int(y1_orig))
-            pts_mm[i] = (x_orig * col_mm, y_orig * row_mm, z_mm)
+        # 兼容：单算法保持原结构；多算法用分组结构
+        if len(metrics_by_alg) == 1:
+            self.navigation_meta = list(metrics_by_alg.values())[0]
+        else:
+            self.navigation_meta = {"selected_algorithm": selected_alg, "algorithms": metrics_by_alg}
 
-        # 重采样 + 样条平滑，尽量满足最小转弯半径
-        pts_mm = self._resample_polyline_by_step(pts_mm, resample_step_mm)
-        best_mm = pts_mm
-        best_r = self._polyline_min_turn_radius_mm(best_mm)
-
-        if len(pts_mm) >= 4:
-            for it in range(max_smoothing_iters):
-                # splprep需要参数t，使用弧长参数化更稳定
-                try:
-                    # s从小到大递增：更平滑 -> 更大转弯半径（但可能偏离中心）
-                    s_val = float((it + 1) * 5.0)
-                    tck, _ = splprep([pts_mm[:, 0], pts_mm[:, 1], pts_mm[:, 2]], s=s_val, k=3)
-                    u = np.linspace(0.0, 1.0, len(pts_mm))
-                    x_s, y_s, z_s = splev(u, tck)
-                    sm = np.stack([x_s, y_s, z_s], axis=1)
-                    sm = self._resample_polyline_by_step(sm, resample_step_mm)
-                    r = self._polyline_min_turn_radius_mm(sm)
-                    if r > best_r:
-                        best_r = r
-                        best_mm = sm
-                    if r >= float(min_turn_radius_mm):
-                        best_mm = sm
-                        best_r = r
-                        break
-                except Exception:
-                    break
-
-        # 沿路径索引再轻平滑：削弱骨架/样条在局部段的左右摆动，减轻漫游时“抖出管壁感”
         try:
-            from scipy.ndimage import gaussian_filter1d
-            sig = 1.15
-            for d in range(3):
-                best_mm[:, d] = gaussian_filter1d(best_mm[:, d], sigma=sig, mode="nearest")
-            best_mm = self._resample_polyline_by_step(best_mm, resample_step_mm)
-            best_r = self._polyline_min_turn_radius_mm(best_mm)
+            sel = metrics_by_alg.get(selected_alg) or {}
+            print(f"  最小转弯半径(估计): {float(sel.get('min_turn_radius_mm_estimated', 0.0)):.1f} mm（目标≥{float(min_turn_radius_mm):.1f} mm）")
         except Exception:
             pass
-
-        print(f"  最小转弯半径(估计): {best_r:.1f} mm（目标≥{float(min_turn_radius_mm):.1f} mm）")
-
-        # 将平滑后的(mm)路径回写到 Plotly 坐标系（x_ds,y_ds,z_mm）并保存体素索引近似
-        # 这里做“近似回投影”：用mm反算原始像素坐标，再减去ROI偏移得到y_roi/x_roi
-        scale_factor = self.downsample_size / self.original_size[0]
-        x_ds = (best_mm[:, 0] / col_mm) * scale_factor
-        y_ds = (best_mm[:, 1] / row_mm) * scale_factor
-        z_mm_arr = best_mm[:, 2]
-        self.navigation_path_plotly = np.stack([x_ds, y_ds, z_mm_arr], axis=1).astype(np.float32)
-
-        # voxel路径用于调试/后续映射：z_idx用“最近切片”匹配
-        z_positions = np.array([float(z) for z, _, _ in self.slices_data], dtype=np.float64)
-        voxel_path = np.zeros((len(best_mm), 3), dtype=np.int32)
-        for i in range(len(best_mm)):
-            z_idx = int(np.argmin(np.abs(z_positions - float(best_mm[i, 2]))))
-            x_orig = int(round(float(best_mm[i, 0]) / col_mm))
-            y_orig = int(round(float(best_mm[i, 1]) / row_mm))
-            voxel_path[i, 0] = z_idx
-            voxel_path[i, 1] = int(y_orig - int(y1_orig))
-            voxel_path[i, 2] = int(x_orig - int(x1_orig))
-        self.navigation_path_voxel = voxel_path
-
-        self.navigation_meta = {
-            "min_turn_radius_mm_target": float(min_turn_radius_mm),
-            "min_turn_radius_mm_estimated": float(best_r if np.isfinite(best_r) else 0.0),
-            "resample_step_mm": float(resample_step_mm),
-            "wall_bias_power": float(wall_bias_power),
-            "spacing_mm": {"dz": float(dz_mm), "dy": float(dy_mm), "dx": float(dx_mm)},
-            "direction": "zmax_to_zmin",
-        }
 
         return True
     
@@ -490,6 +600,114 @@ class DicomTrachea3DPipeline:
             print(f"  Z轴范围: {slices[0][0]:.1f}mm 到 {slices[-1][0]:.1f}mm")
         
         return len(slices)
+
+    def run_simple_3d_preview(
+        self,
+        *,
+        z_min=None,
+        z_max=None,
+        downsample_size: int = 128,
+        iso_value: float = 0.5,
+        step_size: int = 2,
+        output_html: str = "output/simple_preview.html",
+        auto_open: bool = False,
+    ):
+        """
+        仅用于快速确认 DICOM 数据完整性与大体样貌的“简单3D预览”模式：
+        - 不做中心线/充气法/横截面分析
+        - 直接将体数据做窗位窗宽归一化后，用 Marching Cubes 提取一个粗表面
+        适用：第一次接触 dicom3，尚未确定 z_min/z_max/seed 时，先做总体预览。
+        """
+        print("\n" + "=" * 60)
+        print("简单3D预览：仅DICOM体数据可视化（不含分析）")
+        print("=" * 60)
+
+        n = self.step1_load_and_sort_dicom(z_min=z_min, z_max=z_max)
+        if n <= 0:
+            print("✗ 未找到有效切片，无法预览")
+            return False
+
+        # 基本信息：便于用户确定 z_min/z_max 与 seed
+        z0 = float(self.slices_data[0][0])
+        z1 = float(self.slices_data[-1][0])
+        print(f"✓ 切片数: {n}")
+        print(f"✓ Z轴范围(物理): {z0:.1f}mm 到 {z1:.1f}mm")
+
+        # 构建体数据（HU→窗位窗宽→[0,1]），并降采样到方形体（便于快速预览）
+        ds0 = self.slices_data[0][1]
+        h0, w0 = self.slices_data[0][2].shape
+        out_size = int(max(64, min(512, downsample_size)))
+        self.downsample_size = out_size
+        self.original_size = (h0, w0)
+
+        # 估计间距（mm）
+        dz_mm, row_mm, col_mm = self._estimate_spacing_mm()
+        scale = float(h0) / float(out_size)  # 原始像素到降采样像素的缩放倍数（假设近似方形）
+        dy_ds = float(row_mm) * scale
+        dx_ds = float(col_mm) * scale
+
+        window_center, window_width = -600.0, 1500.0
+        img_min = window_center - window_width / 2.0
+        img_max = window_center + window_width / 2.0
+
+        vol = np.zeros((n, out_size, out_size), dtype=np.float32)
+        for i, (_, ds, px) in enumerate(self.slices_data):
+            # HU
+            if hasattr(ds, "RescaleSlope") and hasattr(ds, "RescaleIntercept"):
+                slope = float(ds.RescaleSlope)
+                intercept = float(ds.RescaleIntercept)
+                hu = px.astype(np.float32) * slope + intercept
+            else:
+                hu = px.astype(np.float32)
+            hu = np.clip(hu, img_min, img_max)
+            hu = (hu - img_min) / (img_max - img_min)  # -> [0,1]
+            # 降采样（快速预览优先速度）
+            vol[i] = cv2.resize(hu, (out_size, out_size), interpolation=cv2.INTER_AREA)
+
+        # Marching Cubes（在预览体上提取一个粗表面）
+        try:
+            verts, faces, _, _ = measure.marching_cubes(vol, level=float(iso_value), step_size=int(step_size))
+        except Exception as e:
+            print(f"✗ Marching Cubes 失败: {e}")
+            return False
+
+        # 体素坐标→物理mm（近似）
+        # verts: (z,y,x) in voxel coords of preview volume
+        z_mm = z0 + verts[:, 0] * float(dz_mm)
+        y_mm = verts[:, 1] * float(dy_ds)
+        x_mm = verts[:, 2] * float(dx_ds)
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Mesh3d(
+                x=x_mm,
+                y=y_mm,
+                z=z_mm,
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                color="#9ca3af",
+                opacity=0.20,
+                flatshading=True,
+                name="简单3D预览(粗表面)",
+                showlegend=True,
+            )
+        )
+        fig.update_layout(
+            title=f"Simple 3D Preview | slices={n} | Z=[{z0:.1f},{z1:.1f}]mm | size={out_size} | iso={iso_value:g}",
+            scene=dict(aspectmode="data"),
+            margin=dict(l=0, r=0, t=40, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+
+        os.makedirs(os.path.dirname(output_html) or ".", exist_ok=True)
+        fig.write_html(output_html, include_plotlyjs="cdn")
+        print(f"✓ 简单3D预览已保存: {output_html}")
+
+        if auto_open:
+            webbrowser.open(f"file:///{os.path.abspath(output_html)}")
+            print("✓ 已在浏览器中打开")
+        return True
     
     def _generate_cross_section_analysis(self, z_idx, slice_data, slice_hu=None, mask_3d=None, separated_regions=None):
         """
@@ -1646,9 +1864,18 @@ class DicomTrachea3DPipeline:
         print(f"1. 构建3D二值体数据...")
         print(f"   切片数: {num_slices}, ROI尺寸: {roi_h}×{roi_w}")
         
-        # 构建3D二值体数据
+        # 构建3D二值体数据（严格阈值：用于“种子连通域”）
         volume_binary = np.zeros((num_slices, roi_h, roi_w), dtype=np.uint8)
         slice_thresholds = []  # 记录每个切片的阈值
+
+        # 可选：区域扩展（用严格连通域做种子，在更宽松阈值的约束体内补齐细小管腔）
+        expand_cfg = getattr(self, "expand_cfg", None) or {}
+        expand_enabled = bool(expand_cfg.get("enabled", False))
+        expand_threshold = expand_cfg.get("threshold", None)
+        if expand_enabled and expand_threshold is None and self.fixed_threshold is not None:
+            # 默认比严格阈值更宽松一点（上限避免过度扩张）
+            expand_threshold = float(min(0.60, float(self.fixed_threshold) + 0.05))
+        volume_binary_expand = np.zeros((num_slices, roi_h, roi_w), dtype=np.uint8) if expand_enabled else None
         
         # ⭐ Z屏障：限制充气范围，防止扩散到Z>50mm的区域
         z_barrier = 50.0  # 屏障位置（mm）
@@ -1682,6 +1909,7 @@ class DicomTrachea3DPipeline:
                 slice_thresholds.append(None)
                 continue
             
+            binary2 = None
             if self.fixed_threshold is not None:
                 # 与 step3_generate_mesh 保持一致的窗位窗宽归一化
                 window_center, window_width = -600, 1500
@@ -1692,6 +1920,9 @@ class DicomTrachea3DPipeline:
                 threshold = float(self.fixed_threshold)
                 slice_thresholds.append(threshold)
                 binary = ((roi > -1900) & (roi_windowed < threshold)).astype(np.uint8)
+                if expand_enabled and volume_binary_expand is not None and expand_threshold is not None:
+                    thr2 = float(expand_threshold)
+                    binary2 = ((roi > -1900) & (roi_windowed < thr2)).astype(np.uint8)
             else:
                 threshold = np.percentile(non_bg, self.percentile)
                 slice_thresholds.append(threshold)
@@ -1702,14 +1933,25 @@ class DicomTrachea3DPipeline:
             binary[-1, :] = 0
             binary[:, 0] = 0
             binary[:, -1] = 0
+            if expand_enabled and volume_binary_expand is not None and binary2 is not None:
+                binary2[0, :] = 0
+                binary2[-1, :] = 0
+                binary2[:, 0] = 0
+                binary2[:, -1] = 0
             
             # 形态学操作（只膨胀，扩散白色区域）
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, self.kernel_size)
             binary = cv2.dilate(binary, kernel, iterations=1)
+            if expand_enabled and volume_binary_expand is not None and binary2 is not None:
+                binary2 = cv2.dilate(binary2, kernel, iterations=1)
             
             volume_binary[z_idx] = binary
+            if expand_enabled and volume_binary_expand is not None and binary2 is not None:
+                volume_binary_expand[z_idx] = binary2
         
         print(f"   二值化完成，非零体素: {np.sum(volume_binary > 0):,}")
+        if expand_enabled and volume_binary_expand is not None and expand_threshold is not None:
+            print(f"   扩展约束体: fixed-threshold={float(expand_threshold):g}，非零体素: {np.sum(volume_binary_expand > 0):,}")
         print(f"   ⭐ Z屏障: {z_barrier}mm，屏蔽了{barrier_slices}个切片")
         
         # 1.5 3D形态学闭合操作 - 封闭小孔防止泄漏
@@ -1727,6 +1969,13 @@ class DicomTrachea3DPipeline:
             ).astype(np.uint8)
         else:
             volume_binary = volume_closed.astype(np.uint8)
+
+        # 扩展约束体也做闭合（但不做 erosion，避免把细通路再抹掉）
+        volume_expand_closed = None
+        if expand_enabled and volume_binary_expand is not None and expand_threshold is not None:
+            volume_expand_closed = binary_closing(
+                volume_binary_expand, structure=structure_close, iterations=self.closing_iters
+            ).astype(np.uint8)
         
         closed_voxels = np.sum(volume_binary > 0)
         print(f"   闭合后体素: {closed_voxels:,}")
@@ -1872,6 +2121,51 @@ class DicomTrachea3DPipeline:
         
         trachea_volume = np.sum(trachea_mask_3d)
         print(f"   泄漏控制后体积: {trachea_volume:,}体素 (移除{trachea_volume_raw - trachea_volume:,})")
+
+        # ============================================================
+        # ⭐ 区域扩展（受约束充气/形态学重建）：补齐细小管腔的断连
+        # ============================================================
+        if expand_enabled and volume_expand_closed is not None:
+            try:
+                from scipy.ndimage import binary_dilation  # noqa: WPS433
+            except Exception:
+                binary_dilation = None
+
+            if binary_dilation is None:
+                print("\n4.5 区域扩展跳过：scipy.ndimage.binary_dilation 不可用")
+            else:
+                print("\n4.5 区域扩展（受约束充气/形态学重建）...")
+                max_iters = int(expand_cfg.get("max_iters", 160))
+                min_dist_mm = float(expand_cfg.get("min_dist_mm", 0.0))
+                structure_grow = ndimage.generate_binary_structure(3, 3)  # 26邻域
+
+                constraint = (volume_expand_closed > 0)
+                # 与 z_barrier 一致：只在 barrier 以内扩展
+                for z_idx in range(num_slices):
+                    if float(self.slices_data[z_idx][0]) > float(z_barrier):
+                        constraint[z_idx, :, :] = False
+
+                if min_dist_mm > 1e-6:
+                    dz_mm, dy_mm, dx_mm = self._estimate_spacing_mm()
+                    dist_mm = distance_transform_edt(
+                        constraint, sampling=(dz_mm, dy_mm, dx_mm)
+                    ).astype(np.float32)
+                    constraint = constraint & (dist_mm >= float(min_dist_mm))
+
+                seed = trachea_mask_3d.astype(bool)
+                before = int(np.sum(seed))
+                it = 0
+                while it < max_iters:
+                    grown = binary_dilation(seed, structure=structure_grow) & constraint
+                    if np.array_equal(grown, seed):
+                        break
+                    seed = grown
+                    it += 1
+                after = int(np.sum(seed))
+                trachea_mask_3d = seed
+                print(f"   约束阈值: {float(expand_threshold):g}")
+                print(f"   扩展迭代: {it} 次")
+                print(f"   体积变化: {before:,} -> {after:,} （+{after - before:,}）")
         
         # 5. 提取每个切片的结果（进行圆形度评分，提取中心线）
         print(f"\n5. 提取各切片气管区域（圆形度评分）...")
@@ -2598,7 +2892,9 @@ class DicomTrachea3DPipeline:
                                    start_z=-100.0,
                                    start_idx=None,
                                    navigation_line=False,
-                                   nav_min_turn_radius_mm=12.0):
+                                   nav_min_turn_radius_mm=12.0,
+                                   nav_algorithm: str = "skeleton_dijkstra",
+                                   nav_compare: bool = False):
         """步骤4: 创建完整的3D可视化(网格+充气中心线/导航线+横截面+虚拟内窥镜)
         
         参数:
@@ -2701,27 +2997,60 @@ class DicomTrachea3DPipeline:
         # 2.5) 导航线（仅用3D掩码 + 几何代价；插管方向：zmax -> zmin）
         if navigation_line and use_3d_analysis and hasattr(self, 'trachea_mask_3d') and self.trachea_mask_3d is not None:
             ok = self._compute_navigation_path_from_mask(
+                algorithm=str(nav_algorithm or "skeleton_dijkstra"),
+                compare_algorithms=bool(nav_compare),
                 min_turn_radius_mm=float(nav_min_turn_radius_mm),
                 resample_step_mm=1.0,
                 wall_bias_power=1.5,
             )
             if ok and self.navigation_path_plotly is not None and len(self.navigation_path_plotly) > 1:
+                # 多算法对比：叠加绘制（默认用 selected_algorithm 作为“主导航线”与漫游路径）
+                selected_alg = None
+                try:
+                    if isinstance(self.navigation_meta, dict):
+                        selected_alg = self.navigation_meta.get("selected_algorithm", None)
+                except Exception:
+                    selected_alg = None
+
+                alg_to_path = {}
+                try:
+                    if bool(nav_compare) and isinstance(getattr(self, "navigation_paths_plotly", None), dict) and self.navigation_paths_plotly:
+                        alg_to_path = dict(self.navigation_paths_plotly)
+                except Exception:
+                    alg_to_path = {}
+
+                if not alg_to_path:
+                    alg_to_path = {"selected": self.navigation_path_plotly}
+
+                # 配色：主路径更醒目；对照路径细一点
+                palette = [
+                    ("skeleton_dijkstra", "#00D1B2"),
+                    ("dt_ridge", "#60A5FA"),
+                ]
+                color_map = {k: v for k, v in palette}
+
+                for alg_name, nav in alg_to_path.items():
+                    if nav is None or len(nav) < 2:
+                        continue
+                    is_main = (selected_alg is None and alg_name in ("selected", str(nav_algorithm))) or (selected_alg == alg_name)
+                    c = color_map.get(str(alg_name), "#A78BFA")
+                    fig.add_trace(go.Scatter3d(
+                        x=nav[:, 0],
+                        y=nav[:, 1],
+                        z=nav[:, 2],
+                        mode='lines+markers',
+                        line=dict(color=c, width=(9 if is_main else 4)),
+                        marker=dict(
+                            size=(4 if is_main else 3),
+                            color=c,
+                            line=dict(width=0.5, color='rgba(0,0,0,0.35)'),
+                        ),
+                        opacity=(1.0 if is_main else 0.55),
+                        name=(f"导航线({alg_name})" if bool(nav_compare) else "导航线(插管路径)"),
+                        showlegend=True,
+                    ))
+
                 nav = self.navigation_path_plotly
-                fig.add_trace(go.Scatter3d(
-                    x=nav[:, 0],
-                    y=nav[:, 1],
-                    z=nav[:, 2],
-                    mode='lines+markers',
-                    line=dict(color='#00D1B2', width=8),
-                    marker=dict(
-                        size=4,
-                        color='#00D1B2',
-                        line=dict(width=0.5, color='rgba(0,0,0,0.35)'),
-                    ),
-                    opacity=1.0,
-                    name='导航线(插管路径)',
-                    showlegend=True,
-                ))
                 # 漫游相机 eye 位置（由注入脚本 Plotly.restyle 每帧更新）
                 fig.add_trace(go.Scatter3d(
                     x=[float(nav[0, 0])],
@@ -2769,6 +3098,40 @@ class DicomTrachea3DPipeline:
                     hovertemplate='注视点(漫游)<br>X=%{x:.1f}<br>Y=%{y:.1f}<br>Z=%{z:.1f} mm<extra></extra>',
                 ))
                 print(f"✓ 导航线已添加到3D图: {len(nav)}点")
+                try:
+                    m = self.navigation_meta or {}
+                    # 单算法（旧结构） or 多算法（algorithms分组）
+                    if isinstance(m, dict) and "algorithms" in m and isinstance(m.get("algorithms"), dict):
+                        sel = m.get("selected_algorithm", None)
+                        mm = (m.get("algorithms") or {}).get(sel, None) if sel else None
+                    else:
+                        mm = m
+
+                    if isinstance(mm, dict) and mm:
+                        Lmm = mm.get("path_length_mm", None)
+                        Rmin = mm.get("min_turn_radius_mm_estimated", None)
+                        wd = mm.get("wall_dist_mm", None) or {}
+                        if Lmm is not None or Rmin is not None or wd:
+                            parts = []
+                            if Lmm is not None:
+                                parts.append(f"L={float(Lmm):.1f}mm")
+                            if Rmin is not None:
+                                parts.append(f"Rmin={float(Rmin):.1f}mm")
+                            if wd and wd.get("d_min", None) is not None:
+                                parts.append(f"dmin={float(wd['d_min']):.2f}mm")
+                            if wd and wd.get("d_p05", None) is not None:
+                                parts.append(f"p05={float(wd['d_p05']):.2f}mm")
+                            if wd and wd.get("d_med", None) is not None:
+                                parts.append(f"med={float(wd['d_med']):.2f}mm")
+                            if wd and wd.get("d_mean", None) is not None:
+                                parts.append(f"mean={float(wd['d_mean']):.2f}mm")
+                            if parts:
+                                if bool(nav_compare) and selected_alg:
+                                    print(f"  导航指标({selected_alg}): " + " | ".join(parts))
+                                else:
+                                    print("  导航指标: " + " | ".join(parts))
+                except Exception:
+                    pass
             else:
                 print("⚠ 导航线计算失败或点数不足，已跳过绘制")
         # 充气法网格内已绘制「充气中心线」；此处不再重复添加「中心线」图层
@@ -3608,9 +3971,18 @@ class DicomTrachea3DPipeline:
                 </div>
                 <label style='display:flex;align-items:center;gap:10px;font-size:12px;color:#cbd5e1;'>
                     步进间隔 (ms)
-                    <input id='navCamMs' type='range' min='40' max='280' value='110' style='flex:1;' />
-                    <span id='navCamMsLbl'>110</span>
+                    <input id='navCamMs' type='range' min='10' max='100' value='60' style='flex:1;' />
+                    <span id='navCamMsLbl'>60</span>
                 </label>
+                <label style='display:flex;align-items:center;gap:10px;font-size:12px;color:#cbd5e1;margin-top:8px;'>
+                    点数降采样 (步长)
+                    <input id='navCamDs' type='range' min='1' max='6' value='1' style='flex:1;' />
+                    <span id='navCamDsLbl'>1</span>
+                </label>
+                <div style='margin-top:4px;font-size:11px;color:#94a3b8;line-height:1.35;'>
+                    用于帧率实验：步长=1 表示不降采样；步长=2 表示每 2 个点取 1 个（点数约减半）。<br/>
+                    注意：降采样会牺牲几何细节（可能略增贴壁/急拐），但能显著降低每帧 relayout 开销。
+                </div>
                 <div style='margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.35;'>
                     掩码体素 1 = <b>气腔（充气连通区域）</b>，不是软组织把心腔填实；MC 网格是包绕气腔的壳，相机在腔内时外表面常为背面。<br/>
                     点<b>「腔内模式」</b>：隐藏「其他结构/气管外表面」，显示<b>反向法线内壁</b>并加粗导航线，便于腔内看壁形态。
@@ -3634,7 +4006,17 @@ class DicomTrachea3DPipeline:
                 try {
                     var nav = window.__AIRWAY_NAVIGATION__;
                     if (!nav || !nav.points_plotly || nav.points_plotly.length < 2) return null;
-                    return nav.points_plotly;
+                    var pts = nav.points_plotly;
+                    // 点数降采样（仅影响播放/滑块帧序，不改原始导航线 trace）
+                    var dsEl = document.getElementById('navCamDs');
+                    var ds = dsEl ? parseInt(dsEl.value, 10) : 1;
+                    if (!isFinite(ds) || ds < 1) ds = 1;
+                    if (ds <= 1) return pts;
+                    var out = [];
+                    for (var i = 0; i < pts.length; i += ds) out.push(pts[i]);
+                    // 确保最后一个点保留
+                    if (out.length >= 2 && out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+                    return out;
                 } catch (e) { return null; }
             }
             function getCam() {
@@ -3657,7 +4039,12 @@ class DicomTrachea3DPipeline:
                     eye: cam.eye ? {x: cam.eye.x, y: cam.eye.y, z: cam.eye.z} : {x: 1.25, y: 1.25, z: 1.25}
                 };
             }
-            var timer = null;
+            // 计时器：旧版 setInterval 会与 Plotly relayout promise 抢占，且强制 resize 每帧极易卡顿。
+            // 改为 requestAnimationFrame + 基于时间的节流（依然用 ms 作为“目标步进间隔”）。
+            var timer = null; // 保留：兼容 stop() 的清理；新版不会再 setInterval
+            var rafId = null;
+            var playOn = false;
+            var lastTickMs = 0;
             var idx = 0;
             var initialCam = null;
             var lookAhead = 3;
@@ -3924,12 +4311,39 @@ class DicomTrachea3DPipeline:
                 try {
                     var p = Plotly.relayout(gd, patch);
                     if (p && typeof p.then === 'function') {
-                        p.then(function() { forceSceneRedraw(gd); });
+                        // 关键：避免每帧强制 resize（极易掉帧）。
+                        // 仅低频触发一次，防止个别环境 relayout 后 WebGL 不刷新导致白屏。
+                        p.then(function() {
+                            try {
+                                var now = Date.now();
+                                if (!gd.__navLastResizeMs || (now - gd.__navLastResizeMs) > 650) {
+                                    gd.__navLastResizeMs = now;
+                                    forceSceneRedraw(gd);
+                                }
+                            } catch (e2) {}
+                        });
                     } else {
-                        setTimeout(function() { forceSceneRedraw(gd); }, 0);
+                        // 非 promise：同样做低频保护
+                        setTimeout(function() {
+                            try {
+                                var now = Date.now();
+                                if (!gd.__navLastResizeMs || (now - gd.__navLastResizeMs) > 650) {
+                                    gd.__navLastResizeMs = now;
+                                    forceSceneRedraw(gd);
+                                }
+                            } catch (e3) {}
+                        }, 0);
                     }
                 } catch (e) {
-                    setTimeout(function() { forceSceneRedraw(gd); }, 0);
+                    setTimeout(function() {
+                        try {
+                            var now = Date.now();
+                            if (!gd.__navLastResizeMs || (now - gd.__navLastResizeMs) > 650) {
+                                gd.__navLastResizeMs = now;
+                                forceSceneRedraw(gd);
+                            }
+                        } catch (e4) {}
+                    }, 0);
                 }
             }
 
@@ -4119,6 +4533,11 @@ class DicomTrachea3DPipeline:
 
             function stop() {
                 if (timer) { clearInterval(timer); timer = null; }
+                if (rafId && typeof cancelAnimationFrame === 'function') {
+                    try { cancelAnimationFrame(rafId); } catch (e) {}
+                    rafId = null;
+                }
+                playOn = false;
             }
 
             function start() {
@@ -4127,15 +4546,30 @@ class DicomTrachea3DPipeline:
                 stop();
                 var msInput = document.getElementById('navCamMs');
                 var ms = msInput ? parseInt(msInput.value, 10) : 80;
-                if (!isFinite(ms) || ms < 10) ms = 110;
-                timer = setInterval(function() {
-                    var pts2 = getPts();
-                    if (!pts2) { stop(); return; }
-                    applyCameraForIndex(pts2, idx);
-                    syncPathUi(pts2, idx);
-                    idx += 1;
-                    if (idx >= pts2.length) idx = 0;
-                }, ms);
+                if (!isFinite(ms) || ms < 10) ms = 10;
+                if (ms > 100) ms = 100;
+                playOn = true;
+                lastTickMs = 0;
+                function loop(ts) {
+                    if (!playOn) return;
+                    if (!lastTickMs) lastTickMs = ts;
+                    var dt = ts - lastTickMs;
+                    if (dt >= ms) {
+                        lastTickMs = ts;
+                        var pts2 = getPts();
+                        if (!pts2) { stop(); return; }
+                        applyCameraForIndex(pts2, idx);
+                        syncPathUi(pts2, idx);
+                        idx += 1;
+                        if (idx >= pts2.length) idx = 0;
+                    }
+                    rafId = (typeof requestAnimationFrame === 'function')
+                        ? requestAnimationFrame(loop)
+                        : setTimeout(function() { loop(Date.now()); }, 16);
+                }
+                rafId = (typeof requestAnimationFrame === 'function')
+                    ? requestAnimationFrame(loop)
+                    : setTimeout(function() { loop(Date.now()); }, 16);
             }
 
             function resetCam() {
@@ -4172,12 +4606,27 @@ class DicomTrachea3DPipeline:
                 var reset = document.getElementById('navCamReset');
                 var ms = document.getElementById('navCamMs');
                 var msLbl = document.getElementById('navCamMsLbl');
+                var ds = document.getElementById('navCamDs');
+                var dsLbl = document.getElementById('navCamDsLbl');
                 var path = document.getElementById('navCamPath');
                 if (play) play.addEventListener('click', start);
                 if (pause) pause.addEventListener('click', stop);
                 if (reset) reset.addEventListener('click', resetCam);
                 if (ms && msLbl) {
                     ms.addEventListener('input', function() { msLbl.textContent = String(ms.value); });
+                }
+                if (ds && dsLbl) {
+                    ds.addEventListener('input', function() {
+                        dsLbl.textContent = String(ds.value);
+                        // 变更点数 → 立即暂停并刷新 UI 边界
+                        stop();
+                        var pts = getPts();
+                        if (pts) {
+                            idx = Math.max(0, Math.min(idx, pts.length - 1));
+                            syncPathUi(pts, idx);
+                            applyCameraForIndex(pts, idx);
+                        }
+                    });
                 }
                 if (path) {
                     path.addEventListener('input', function() {
@@ -4615,6 +5064,13 @@ class DicomTrachea3DPipeline:
             "3d_erosion_iterations": self.erosion_iters,
         }
 
+        # 若存在导航线指标（用于对比导航质量），写入实验信息底部
+        try:
+            if getattr(self, "navigation_meta", None):
+                safe_args["_navigation_metrics"] = self.navigation_meta
+        except Exception:
+            pass
+
         intro = (self.experiment_intro or "").strip()
         intro_html = (
             intro.replace("&", "&amp;")
@@ -4624,6 +5080,61 @@ class DicomTrachea3DPipeline:
 
         args_pretty = json.dumps(safe_args, ensure_ascii=False, indent=2)
 
+        # 工程化参数统计（导航线指标）
+        nav_metrics = None
+        try:
+            nav_metrics = self.navigation_meta if getattr(self, "navigation_meta", None) else None
+        except Exception:
+            nav_metrics = None
+
+        def _fmt(x, nd=2):
+            try:
+                if x is None:
+                    return "—"
+                return f"{float(x):.{int(nd)}f}"
+            except Exception:
+                return "—"
+
+        metrics_rows = ""
+        if isinstance(nav_metrics, dict) and nav_metrics:
+            def row(bg, name, desc, val):
+                return (
+                    f"<tr style='background:{bg};'>"
+                    f"<td style='padding:10px 12px;border-bottom:1px solid #243244;color:#e2e8f0;font-weight:700;'>{name}</td>"
+                    f"<td style='padding:10px 12px;border-bottom:1px solid #243244;color:#cbd5e1;'>{desc}</td>"
+                    f"<td style='padding:10px 12px;border-bottom:1px solid #243244;font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, Courier New, monospace; font-weight:900;color:#f8fafc;'>{val}</td>"
+                    f"</tr>"
+                )
+
+            zebra = ["#0b1220", "#0c162a"]
+            def render_one(m: dict):
+                wd = (m or {}).get("wall_dist_mm") or {}
+                return "\n".join(
+                    [
+                        row(zebra[0], "路径长度 L", "导航线折线总长度（相邻点欧氏距离求和）", f"{_fmt((m or {}).get('path_length_mm'), 1)} mm"),
+                        row(zebra[1], "最小转弯半径 Rmin", "三点外接圆半径的最小值（越大越平滑、更插管友好）", f"{_fmt((m or {}).get('min_turn_radius_mm_estimated'), 1)} mm"),
+                        row(zebra[0], "贴壁距离 dmin", "路径点到最近壁面的最小距离（最贴壁点风险）", f"{_fmt(wd.get('d_min'), 2)} mm"),
+                        row(zebra[1], "贴壁距离 p05", "贴壁距离 5% 分位（比 dmin 更稳健，适合 A/B 对比）", f"{_fmt(wd.get('d_p05'), 2)} mm"),
+                        row(zebra[0], "贴壁距离中位数 med", "贴壁距离中位数（反映整体是否居中）", f"{_fmt(wd.get('d_med'), 2)} mm"),
+                        row(zebra[1], "贴壁距离均值 mean", "贴壁距离平均值（受极端点影响更大）", f"{_fmt(wd.get('d_mean'), 2)} mm"),
+                    ]
+                )
+
+            # 多算法对比：按算法分组展示
+            if isinstance(nav_metrics.get("algorithms"), dict):
+                sel = nav_metrics.get("selected_algorithm", None)
+                blocks = []
+                for alg_name, mm in (nav_metrics.get("algorithms") or {}).items():
+                    tag = "（已选用/用于漫游）" if (sel is not None and str(alg_name) == str(sel)) else ""
+                    blocks.append(
+                        f"<tr style='background:#0f1a2e;'><td colspan='3' style='padding:10px 12px;border-bottom:1px solid #243244;color:#f8fafc;font-weight:900;'>算法: {alg_name}{tag}</td></tr>"
+                    )
+                    if isinstance(mm, dict) and mm:
+                        blocks.append(render_one(mm))
+                metrics_rows = "\n".join(blocks)
+            else:
+                metrics_rows = render_one(nav_metrics)
+
         return f"""
         <div style="margin-top: 40px; padding: 20px; background: #0b1220; color: #e5e7eb; border-top: 3px solid #2563eb; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">
             <h2 style="margin: 0 0 10px; font-family: system-ui, -apple-system, sans-serif; color: #fff;">🧪 实验信息</h2>
@@ -4632,6 +5143,28 @@ class DicomTrachea3DPipeline:
                 <div><b>结束时间</b>: {ended_str}</div>
                 <div><b>耗时</b>: {duration_s:.2f} s</div>
                 <div><b>输出前缀</b>: {self.output_name}</div>
+            </div>
+
+            <h3 style="margin: 14px 0 8px; font-family: system-ui, -apple-system, sans-serif; color:#fff;">工程化参数统计</h3>
+            <div style="background:#0b1220;padding:12px;border-radius:10px;margin:0 0 14px;border:1px solid #243244;">
+                <div style="font-size:12px;color:#cbd5e1;margin-bottom:10px;line-height:1.55;">
+                    说明：以下指标用于评价导航线质量与插管/漫游友好性（用于 A/B 对比）。若未启用导航线或指标不可用，将显示“—”。
+                </div>
+                <table style="width:100%;border-collapse:separate;border-spacing:0;font-family: system-ui, -apple-system, sans-serif;font-size:12.5px;border:1px solid #243244;border-radius:10px;overflow:hidden;">
+                    <thead>
+                        <tr>
+                            <th style="text-align:left;padding:10px 12px;border-bottom:1px solid #243244;background:#0f1a2e;color:#f8fafc;letter-spacing:0.2px;">指标</th>
+                            <th style="text-align:left;padding:10px 12px;border-bottom:1px solid #243244;background:#0f1a2e;color:#f8fafc;letter-spacing:0.2px;">中文解释</th>
+                            <th style="text-align:left;padding:10px 12px;border-bottom:1px solid #243244;background:#0f1a2e;color:#f8fafc;letter-spacing:0.2px;">数值</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {metrics_rows if metrics_rows else "<tr style='background:#0b1220;'><td style='padding:10px 12px;border-bottom:1px solid #243244;color:#e2e8f0;'>—</td><td style='padding:10px 12px;border-bottom:1px solid #243244;color:#cbd5e1;'>本次未生成导航线指标</td><td style='padding:10px 12px;border-bottom:1px solid #243244;font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, Courier New, monospace; font-weight:800;color:#f8fafc;'>—</td></tr>"}
+                    </tbody>
+                </table>
+                <div style="margin-top:10px;font-size:11.5px;color:#94a3b8;line-height:1.5;">
+                    推荐关注：<b style="color:#e2e8f0;">Rmin</b>（急拐程度）与 <b style="color:#e2e8f0;">p05</b>（贴壁风险的稳健统计）。
+                </div>
             </div>
 
             <h3 style="margin: 14px 0 8px; font-family: system-ui, -apple-system, sans-serif; color:#fff;">简介（运行前命令行填写）</h3>
@@ -4649,6 +5182,8 @@ class DicomTrachea3DPipeline:
                          auto_open=True, use_3d_analysis=False, use_flood_fill=True,
                          start_z=-100.0, start_idx=None,
                          navigation_line=False, nav_min_turn_radius_mm=12.0,
+                         nav_algorithm: str = "skeleton_dijkstra",
+                         nav_compare: bool = False,
                          vtk_flythrough_mp4=None):
         """运行完整流程
         
@@ -4677,7 +5212,8 @@ class DicomTrachea3DPipeline:
         fig = self.step4_create_visualization(output_html, show_endoscopy,
                                               show_cross_sections, cross_section_interval,
                                               use_3d_analysis, use_flood_fill, start_z, start_idx,
-                                              navigation_line, nav_min_turn_radius_mm)
+                                              navigation_line, nav_min_turn_radius_mm,
+                                              nav_algorithm, nav_compare)
 
         if vtk_flythrough_mp4:
             try:
@@ -4759,8 +5295,13 @@ def main():
                        help='3D erosion 迭代次数(默认: 1；可设0表示不做erosion)')
     parser.add_argument('--intro', type=str, default="",
                        help='本次实验简介（用于记录思路/目的，写入HTML底部）')
-    parser.add_argument('--z-min', type=float, required=True, help='Z轴最小值(mm)【必填】')
-    parser.add_argument('--z-max', type=float, required=True, help='Z轴最大值(mm)【必填】')
+    parser.add_argument(
+        '--simple-3d',
+        action='store_true',
+        help='仅做简单3D预览（用于快速确认 dicom3 完整性/样貌，便于后续确定 z_min/z_max/seed；该模式下 z/seed 不再强制必填）',
+    )
+    parser.add_argument('--z-min', type=float, default=None, help='Z轴最小值(mm)')
+    parser.add_argument('--z-max', type=float, default=None, help='Z轴最大值(mm)')
     parser.add_argument('--no-cross-sections', action='store_true',
                        help='不显示横截面切片')
     parser.add_argument('--section-interval', type=int, default=15,
@@ -4775,7 +5316,7 @@ def main():
                        help='使用3D分析(推荐启用)')
     parser.add_argument('--use-propagation', action='store_true',
                        help='使用传统传播法而非充气法(默认使用充气法)')
-    seed_group = parser.add_mutually_exclusive_group(required=True)
+    seed_group = parser.add_mutually_exclusive_group(required=False)
     seed_group.add_argument('--start-z', type=float, default=None,
                             help='3D分析起始Z坐标(mm)【必填二选一: --start-z 或 --start-idx】')
     seed_group.add_argument('--start-idx', type=int, default=None,
@@ -4785,6 +5326,22 @@ def main():
                        help='从3D二值掩码提取插管导航线，并绘制到3D图层（仅用体素图+几何代价）')
     parser.add_argument('--nav-min-radius', type=float, default=12.0,
                        help='导航线最小转弯半径(mm)约束的目标值(默认: 12.0)')
+    parser.add_argument('--nav-algorithm', type=str, default='skeleton_dijkstra',
+                       choices=['skeleton_dijkstra', 'dt_ridge'],
+                       help='导航线算法(默认: skeleton_dijkstra；dt_ridge 为传统DT峰值基线)')
+    parser.add_argument('--nav-compare', action='store_true',
+                       help='同时计算并叠加绘制多种导航线算法（当前: skeleton_dijkstra vs dt_ridge），并在实验信息底部按算法分组输出指标')
+
+    parser.add_argument('--expand-trachea', action='store_true',
+                       help='对3D充气法结果做“受约束区域扩展”（用连通域作种子，在更宽松阈值约束体内补齐细小管腔）')
+    parser.add_argument('--expand-threshold', type=float, default=None,
+                       help='扩展约束体的 fixed-threshold（[0,1]）。不填则默认 = fixed-threshold + 0.05（上限0.60）')
+    parser.add_argument('--expand-max-iters', type=int, default=160,
+                       help='区域扩展最大迭代次数（默认 160）')
+    parser.add_argument('--expand-min-dist-mm', type=float, default=0.0,
+                       help='可选：扩展时要求“离壁最小距离(mm)”（默认 0，关闭；用于抑制向大空腔泄漏）')
+    parser.add_argument('--expand-by-shell', action='store_true',
+                       help='用“其他结构”外形壳作为密封边界：自动启用 --expand-trachea 且将 expand-threshold 设为 --iso（壳的等值面）。')
     parser.add_argument(
         '--vtk-flythrough',
         nargs='?',
@@ -4795,6 +5352,19 @@ def main():
     )
     
     args = parser.parse_args()
+
+    # 非 simple-3d 模式：补齐“必填约束”（保持与 README / 研发日志一致）
+    if not args.simple_3d:
+        if args.z_min is None or args.z_max is None:
+            parser.error("需要提供 --z-min 与 --z-max（或使用 --simple-3d 仅做预览）")
+        if args.start_z is None and args.start_idx is None:
+            parser.error("需要提供 --start-z 或 --start-idx（或使用 --simple-3d 仅做预览）")
+
+    # 用外形壳作为边界：expand-threshold := iso，并自动启用扩展
+    if args.expand_by_shell:
+        args.expand_trachea = True
+        if args.expand_threshold is None:
+            args.expand_threshold = float(args.iso)
     
     # 根据DICOM文件夹自动调整参数(仅影响中心线提取和切片显示范围,不过滤DICOM加载)
     dicom_path = args.dicom.lower()
@@ -4846,6 +5416,25 @@ def main():
     pipeline.experiment_intro = args.intro or ""
     pipeline.experiment_args = vars(args).copy()
     pipeline.experiment_started_at = datetime.datetime.now()
+    pipeline.expand_cfg = {
+        "enabled": bool(args.expand_trachea),
+        "threshold": args.expand_threshold,
+        "max_iters": int(args.expand_max_iters),
+        "min_dist_mm": float(args.expand_min_dist_mm),
+    }
+
+    # simple-3d：仅预览，不进入完整流程
+    if args.simple_3d:
+        success = pipeline.run_simple_3d_preview(
+            z_min=args.z_min,
+            z_max=args.z_max,
+            downsample_size=args.size if args.size else 128,
+            iso_value=args.iso,
+            step_size=args.step,
+            output_html=output_html,
+            auto_open=(args.open and (not args.no_open)),
+        )
+        return 0 if success else 1
     
     # 运行完整流程
     success = pipeline.run_full_pipeline(
@@ -4865,6 +5454,8 @@ def main():
         start_idx=args.start_idx,
         navigation_line=args.navigation_line,
         nav_min_turn_radius_mm=args.nav_min_radius,
+        nav_algorithm=args.nav_algorithm,
+        nav_compare=args.nav_compare,
         vtk_flythrough_mp4=fly_mp4,
     )
     
