@@ -217,6 +217,15 @@ class DicomTrachea3DPipeline:
 
         mask = (self.trachea_mask_3d > 0)
         if mask.ndim != 3 or np.sum(mask) < 50:
+            try:
+                self.navigation_meta = {
+                    "failure": "mask_too_small_or_invalid",
+                    "mask_sum": int(np.sum(mask)) if hasattr(mask, "sum") else None,
+                }
+                if isinstance(getattr(self, "experiment_args", None), dict):
+                    self.experiment_args["_navigation_metrics"] = self.navigation_meta
+            except Exception:
+                pass
             return False
 
         dz_mm, dy_mm, dx_mm = self._estimate_spacing_mm()
@@ -224,6 +233,35 @@ class DicomTrachea3DPipeline:
         # 距离变换（mm）：在掩码内部，离壁越远值越大
         from scipy.ndimage import distance_transform_edt
         dist_mm = distance_transform_edt(mask, sampling=(dz_mm, dy_mm, dx_mm)).astype(np.float32)
+
+        # 为图搜索/TEASAR 等“全体素”算法准备：只在 mask 包围盒内运行（大幅降计算量）
+        def _mask_bbox_with_pad(m: np.ndarray, pad: int = 2):
+            zz, yy, xx = np.nonzero(m)
+            if zz.size == 0:
+                return None
+            z0, z1 = int(np.min(zz)), int(np.max(zz))
+            y0, y1 = int(np.min(yy)), int(np.max(yy))
+            x0, x1 = int(np.min(xx)), int(np.max(xx))
+            z0 = max(0, z0 - pad)
+            y0 = max(0, y0 - pad)
+            x0 = max(0, x0 - pad)
+            z1 = min(int(m.shape[0] - 1), z1 + pad)
+            y1 = min(int(m.shape[1] - 1), y1 + pad)
+            x1 = min(int(m.shape[2] - 1), x1 + pad)
+            return (z0, z1, y0, y1, x0, x1)
+
+        bbox = _mask_bbox_with_pad(mask, pad=2)
+        if bbox is None:
+            return False
+        bz0, bz1, by0, by1, bx0, bx1 = bbox
+        mask_bb = mask[bz0:bz1 + 1, by0:by1 + 1, bx0:bx1 + 1]
+        dist_bb = dist_mm[bz0:bz1 + 1, by0:by1 + 1, bx0:bx1 + 1]
+
+        def _to_bb(p):
+            return (int(p[0]) - bz0, int(p[1]) - by0, int(p[2]) - bx0)
+
+        def _from_bb(p):
+            return (int(p[0]) + bz0, int(p[1]) + by0, int(p[2]) + bx0)
 
         # 起终点：沿堆叠方向，从“物理Z较大端(zmax/头侧)”与“物理Z较小端(zmin/足侧)”
         # 各自向内找到第一个仍有掩码的切片（充气结果常在两端若干层为空，不能硬用0/N-1）
@@ -377,23 +415,305 @@ class DicomTrachea3DPipeline:
                     return None
                 return np.asarray(pts, dtype=np.int32)
 
+            if alg_name in ("astar_cost", "a_star", "astar", "cost_astar"):
+                # 传统：在整个3D掩码体素图上做“代价最短路”（这里用 skimage 的 MCP 近似 A* / Dijkstra）
+                print("\n计算导航线：A* / 最短路（全体素 cost volume）...")
+                try:
+                    from skimage.graph import route_through_array
+                except Exception as e:
+                    print(f"  ✗ skimage.graph 不可用: {e}")
+                    return None
+
+                start = start_guess
+                goal = goal_guess
+                if start is None or goal is None:
+                    return None
+
+                # cost：越贴壁越大；掩码外给极大值
+                eps = 1e-3
+                try:
+                    c = (1.0 / (dist_bb + eps)) ** float(wall_bias_power)
+                    c = c.astype(np.float32, copy=False)
+                    c[~mask_bb] = np.float32(1e9)
+                except Exception:
+                    return None
+
+                try:
+                    s0 = _to_bb(start)
+                    g0 = _to_bb(goal)
+                    path, _ = route_through_array(
+                        c,
+                        tuple(int(x) for x in s0),
+                        tuple(int(x) for x in g0),
+                        fully_connected=True,
+                        geometric=True,
+                    )
+                    if not path or len(path) < 3:
+                        print("  ✗ A* 路径点过少")
+                        return None
+                    out = np.asarray([_from_bb(p) for p in path], dtype=np.int32)
+                    print(f"  A* 路径长度: {len(out)}点")
+                    return out
+                except Exception as e:
+                    print(f"  ✗ A* 路径失败: {e}")
+                    return None
+
+            if alg_name in ("fast_marching", "fmm", "mcp_geometric", "geodesic"):
+                # 传统：Fast marching / geodesic（同样用 MCP_Geometric 风格的 route_through_array）
+                print("\n计算导航线：Fast marching / Geodesic（MCP_Geometric）...")
+                try:
+                    from skimage.graph import MCP_Geometric
+                except Exception as e:
+                    print(f"  ✗ skimage.graph 不可用: {e}")
+                    return None
+
+                start = start_guess
+                goal = goal_guess
+                if start is None or goal is None:
+                    return None
+
+                eps = 1e-3
+                try:
+                    c = (1.0 / (dist_bb + eps)) ** float(wall_bias_power)
+                    c = c.astype(np.float32, copy=False)
+                    c[~mask_bb] = np.float32(1e9)
+                except Exception:
+                    return None
+
+                try:
+                    m = MCP_Geometric(c, fully_connected=True)
+                    # find_costs expects list of starts
+                    s0 = _to_bb(start)
+                    g0 = _to_bb(goal)
+                    m.find_costs([tuple(int(x) for x in s0)])
+                    path = m.traceback(tuple(int(x) for x in g0))
+                    if not path or len(path) < 3:
+                        print("  ✗ FMM 路径点过少")
+                        return None
+                    out = np.asarray([_from_bb(p) for p in path], dtype=np.int32)
+                    print(f"  FMM 路径长度: {len(out)}点")
+                    return out
+                except Exception as e:
+                    print(f"  ✗ FMM 路径失败: {e}")
+                    return None
+
+            if alg_name in ("teasar", "teasar_greedy", "medial_greedy"):
+                # 传统：TEASAR（Tree-structure Extraction by Adaptive Subdivision of Axial Rays）
+                # 这里实现一个“树提取 + 从树上取 start→goal 主干”的对照算法：
+                # - 用 geodesic (MCP_Geometric) 在 cost volume 上做回溯得到 trunk/branches
+                # - 用“覆盖半径”剔除已解释区域，迭代得到树状中心线集合
+                # - 将 goal 投影到树上，再在树图上求 root(start)→goal 的路径作为输出
+                print("\n计算导航线：TEASAR（tree centerline baseline）...")
+                try:
+                    from skimage.graph import MCP_Geometric
+                except Exception as e:
+                    print(f"  ✗ skimage.graph 不可用: {e}")
+                    return None
+
+                start = start_guess
+                goal = goal_guess
+                if start is None or goal is None:
+                    return None
+
+                # TEASAR 在 bbox 内运行，降低计算量
+                zN2, yN, xN = mask_bb.shape
+
+                # cost：越贴壁越大（中心更优）；掩码外不可达
+                eps = 1e-3
+                try:
+                    cost0 = (1.0 / (dist_bb + eps)) ** float(wall_bias_power)
+                    cost0 = cost0.astype(np.float32, copy=False)
+                    cost0[~mask_bb] = np.float32(1e9)
+                except Exception:
+                    return None
+
+                # TEASAR 超参（偏“经典口径 + 计算可控”）
+                max_branches = 24
+                # 覆盖半径缩放（<1 更保守，避免过度删除导致树断裂）
+                cover_scale = 0.90
+                # 最小可接受半径（mm）；太小的点通常是贴壁/噪声
+                min_cover_r_mm = float(min(dy_mm, dx_mm, dz_mm)) * 1.25
+
+                avail = mask_bb.copy()
+                centerline_nodes = set()  # {(z,y,x), ...}
+
+                def _inside(z, y, x):
+                    return (0 <= z < zN2 and 0 <= y < yN and 0 <= x < xN)
+
+                def _cover_ball(cz, cy, cx, r_mm: float):
+                    # 用 ellipsoid 近似球（按 spacing 转换到 voxel 半径）
+                    try:
+                        if not np.isfinite(r_mm) or r_mm <= 0:
+                            return
+                        if r_mm < min_cover_r_mm:
+                            return
+                        rz = int(np.ceil((r_mm / float(dz_mm)) * cover_scale))
+                        ry = int(np.ceil((r_mm / float(dy_mm)) * cover_scale))
+                        rx = int(np.ceil((r_mm / float(dx_mm)) * cover_scale))
+                        z0, z1 = max(0, cz - rz), min(zN2 - 1, cz + rz)
+                        y0, y1 = max(0, cy - ry), min(yN - 1, cy + ry)
+                        x0, x1 = max(0, cx - rx), min(xN - 1, cx + rx)
+                        # 逐体素剔除（范围通常不大；可接受）
+                        for zz in range(z0, z1 + 1):
+                            dz2 = ((zz - cz) * float(dz_mm)) ** 2
+                            for yy in range(y0, y1 + 1):
+                                dy2 = ((yy - cy) * float(dy_mm)) ** 2
+                                for xx in range(x0, x1 + 1):
+                                    dx2 = ((xx - cx) * float(dx_mm)) ** 2
+                                    if dz2 + dy2 + dx2 <= (r_mm * cover_scale) ** 2:
+                                        avail[zz, yy, xx] = False
+                    except Exception:
+                        return
+
+                def _build_mcp_on_avail():
+                    c = cost0.copy()
+                    c[~avail] = np.float32(1e9)
+                    return MCP_Geometric(c, fully_connected=True)
+
+                root = _to_bb(start)
+                if not _inside(*root) or not mask_bb[root]:
+                    return None
+
+                # 迭代提取 trunk + branches：每次从 root 出发找 geodesic 最远点并回溯
+                for it in range(int(max_branches)):
+                    if not avail[root]:
+                        # root 若被覆盖剔除：强行保留 root
+                        avail[root] = True
+                    m = _build_mcp_on_avail()
+                    try:
+                        costs, _ = m.find_costs([root])
+                    except Exception as e:
+                        print(f"  ✗ TEASAR FMM 失败: {e}")
+                        break
+
+                    # 找到 avail 内“最远”的点（geodesic）
+                    costs = np.asarray(costs)
+                    ok = np.isfinite(costs) & (costs < 1e8) & avail
+                    if not np.any(ok):
+                        break
+                    # 选最大 cost 的体素作为端点
+                    flat = int(np.argmax(np.where(ok, costs, -np.inf)))
+                    pz = flat // (yN * xN)
+                    rem = flat - pz * (yN * xN)
+                    py = rem // xN
+                    px = rem - py * xN
+                    far = (int(pz), int(py), int(px))
+
+                    # 回溯路径 far -> root
+                    try:
+                        path = m.traceback(far)
+                    except Exception:
+                        path = None
+                    if not path or len(path) < 3:
+                        break
+
+                    # 记录中心线节点，并做覆盖剔除
+                    for (zz, yy, xx) in path:
+                        node = (int(zz), int(yy), int(xx))
+                        centerline_nodes.add(node)
+                        try:
+                            rmm = float(dist_bb[node])
+                        except Exception:
+                            rmm = 0.0
+                        _cover_ball(node[0], node[1], node[2], rmm)
+
+                    # 若 goal 已经在 centerline 上（或很近），可提前停止提树
+                    if goal is not None:
+                        gz, gy, gx = (int(goal[0]), int(goal[1]), int(goal[2]))
+                        if (gz, gy, gx) in centerline_nodes:
+                            break
+
+                if not centerline_nodes:
+                    print("  ✗ TEASAR 未提取到中心线节点")
+                    return None
+
+                # 将 goal 投影到 tree 节点集合
+                gz, gy, gx = _to_bb(goal)
+                goal_node = None
+                best_d2 = None
+                # 先尝试局部邻域加速（半径 12 vox）
+                rr = 12
+                for zz in range(max(0, gz - rr), min(zN2 - 1, gz + rr) + 1):
+                    for yy in range(max(0, gy - rr), min(yN - 1, gy + rr) + 1):
+                        for xx in range(max(0, gx - rr), min(xN - 1, gx + rr) + 1):
+                            if (zz, yy, xx) in centerline_nodes:
+                                d2 = (zz - gz) * (zz - gz) + (yy - gy) * (yy - gy) + (xx - gx) * (xx - gx)
+                                if best_d2 is None or d2 < best_d2:
+                                    best_d2 = d2
+                                    goal_node = (zz, yy, xx)
+                if goal_node is None:
+                    # fallback：全局扫（centerline 规模通常可控）
+                    for (zz, yy, xx) in centerline_nodes:
+                        d2 = (zz - gz) * (zz - gz) + (yy - gy) * (yy - gy) + (xx - gx) * (xx - gx)
+                        if best_d2 is None or d2 < best_d2:
+                            best_d2 = d2
+                            goal_node = (int(zz), int(yy), int(xx))
+
+                if goal_node is None:
+                    print("  ✗ TEASAR: goal 无法投影到中心线树")
+                    return None
+
+                # 在中心线节点集合上做 BFS（26 邻域）找 root→goal_node 路径
+                from collections import deque
+                offs = [(oz, oy, ox) for oz in (-1, 0, 1) for oy in (-1, 0, 1) for ox in (-1, 0, 1) if not (oz == 0 and oy == 0 and ox == 0)]
+                q = deque([root])
+                parent = {root: None}
+                found = False
+                while q:
+                    cur = q.popleft()
+                    if cur == goal_node:
+                        found = True
+                        break
+                    cz, cy, cx = cur
+                    for oz, oy, ox in offs:
+                        nz, ny, nx = cz + oz, cy + oy, cx + ox
+                        nxt = (int(nz), int(ny), int(nx))
+                        if nxt in parent:
+                            continue
+                        if nxt not in centerline_nodes:
+                            continue
+                        parent[nxt] = cur
+                        q.append(nxt)
+
+                if not found:
+                    print("  ✗ TEASAR: tree 上 root→goal 不连通")
+                    return None
+
+                path_nodes = []
+                cur = goal_node
+                while cur is not None:
+                    path_nodes.append(cur)
+                    cur = parent.get(cur, None)
+                path_nodes.reverse()
+
+                out = np.asarray([_from_bb(p) for p in path_nodes], dtype=np.int32)
+                print(f"  TEASAR(tree) 路径长度: {len(out)}点（tree_nodes={len(centerline_nodes)}）")
+                return out
+
             print(f"  ✗ 未知导航算法: {alg_name}")
             return None
 
         # 选择需要计算的算法列表
         if compare_algorithms:
-            algs = ["skeleton_dijkstra", "dt_ridge"]
+            algs = ["skeleton_dijkstra", "dt_ridge", "astar_cost", "fast_marching", "teasar"]
         else:
             algs = [algorithm or "skeleton_dijkstra"]
 
         paths_voxel = {}
         paths_plotly = {}
         metrics_by_alg = {}
+        failures_by_alg = {}
 
         for alg in algs:
-            path_zyx = compute_one(str(alg))
-            if path_zyx is None or len(path_zyx) < 3:
+            alg = str(alg)
+            path_zyx = compute_one(alg)
+            if path_zyx is None:
+                failures_by_alg[alg] = {"ok": False, "reason": "path_none"}
                 continue
+            if len(path_zyx) < 3:
+                failures_by_alg[alg] = {"ok": False, "reason": "path_too_short", "n": int(len(path_zyx))}
+                continue
+            failures_by_alg[alg] = {"ok": True, "n": int(len(path_zyx))}
 
             # 转为物理坐标(mm)用于平滑与转弯半径约束
             x1_orig, y1_orig = self.roi_offset  # 原始分辨率ROI偏移
@@ -511,20 +831,84 @@ class DicomTrachea3DPipeline:
             paths_plotly[str(alg)] = nav_plotly
 
         if not metrics_by_alg:
+            try:
+                self.navigation_meta = {
+                    "failure": "no_valid_paths",
+                    "compare": bool(compare_algorithms),
+                    "algorithm": str(algorithm),
+                    "failures_by_alg": failures_by_alg,
+                }
+                if isinstance(getattr(self, "experiment_args", None), dict):
+                    self.experiment_args["_navigation_metrics"] = self.navigation_meta
+            except Exception:
+                pass
             return False
 
-        # 选一个“主导航线”供漫游/默认展示：优先 p05，其次 Rmin，最后偏短
-        def score(m: dict):
-            wd = (m or {}).get("wall_dist_mm") or {}
-            p05 = wd.get("d_p05", None)
-            rmin = m.get("min_turn_radius_mm_estimated", None)
-            Lmm = m.get("path_length_mm", None)
-            p05v = float(p05) if p05 is not None else -1.0
-            rminv = float(rmin) if rmin is not None else -1.0
-            Lvv = float(Lmm) if Lmm is not None else 1e18
-            return (p05v, rminv, -Lvv)
+        # ============================================================
+        # 主路径选择规则（工程口径锁死）：
+        # - nav-compare 时：主路径始终固定为 skeleton_dijkstra
+        # - 若 skeleton_dijkstra 失败：整次 nav-compare 判失败（不输出主路径）
+        # ============================================================
+        if bool(compare_algorithms):
+            if "skeleton_dijkstra" not in metrics_by_alg:
+                # skeleton 失败：明确失败，不再“自动选其他算法顶替”
+                self.navigation_meta = {
+                    "failure": "main_path_required_but_missing",
+                    "main_required": "skeleton_dijkstra",
+                    "compare": True,
+                    "failures_by_alg": failures_by_alg,
+                    "algorithms": metrics_by_alg,
+                }
+                try:
+                    if isinstance(getattr(self, "experiment_args", None), dict):
+                        self.experiment_args["_navigation_metrics"] = self.navigation_meta
+                except Exception:
+                    pass
+                return False
+            selected_alg = "skeleton_dijkstra"
+        else:
+            selected_alg = list(metrics_by_alg.keys())[0]
 
-        selected_alg = max(metrics_by_alg.keys(), key=lambda k: score(metrics_by_alg[k]))
+        selection_rule = {
+            "name": ("fixed_to_skeleton_dijkstra" if bool(compare_algorithms) else "single_algorithm"),
+            "priority": (["force selected_algorithm = skeleton_dijkstra"] if bool(compare_algorithms) else ["n/a"]),
+        }
+        selection_scores = {}
+        try:
+            for k, m in (metrics_by_alg or {}).items():
+                wd = (m or {}).get("wall_dist_mm") or {}
+                selection_scores[str(k)] = {
+                    "d_p05": wd.get("d_p05", None),
+                    "Rmin": m.get("min_turn_radius_mm_estimated", None),
+                    "L": m.get("path_length_mm", None),
+                }
+        except Exception:
+            selection_scores = {}
+
+        # TEASAR（当前实现为简化 greedy）：保留但给出工程化失败标记（不参与主路径）
+        try:
+            if "teasar" in metrics_by_alg:
+                m_te = metrics_by_alg.get("teasar") or {}
+                m_sk = metrics_by_alg.get("skeleton_dijkstra") or {}
+                L_te = float(m_te.get("path_length_mm", 0.0) or 0.0)
+                R_te = float(m_te.get("min_turn_radius_mm_estimated", 0.0) or 0.0)
+                L_sk = float(m_sk.get("path_length_mm", 0.0) or 0.0)
+                # 规则：极小 Rmin 或 过长 L => 认为“未完成导航任务/不可用”
+                too_curvy = (R_te > 0 and R_te < 2.0)
+                too_long = (L_sk > 0 and L_te > 3.0 * L_sk)
+                if too_curvy or too_long:
+                    failures_by_alg["teasar"] = {
+                        "ok": False,
+                        "reason": "sanity_fail",
+                        "detail": {
+                            "Rmin_mm": R_te,
+                            "L_mm": L_te,
+                            "L_skeleton_mm": L_sk,
+                            "rule": "Rmin<2.0mm or L>3*L_skeleton",
+                        },
+                    }
+        except Exception:
+            pass
 
         self.navigation_paths_plotly = paths_plotly
         self.navigation_paths_voxel = paths_voxel
@@ -535,7 +919,45 @@ class DicomTrachea3DPipeline:
         if len(metrics_by_alg) == 1:
             self.navigation_meta = list(metrics_by_alg.values())[0]
         else:
-            self.navigation_meta = {"selected_algorithm": selected_alg, "algorithms": metrics_by_alg}
+            self.navigation_meta = {
+                "selected_algorithm": selected_alg,
+                "selection_rule": selection_rule,
+                "selection_scores": selection_scores,
+                "failures_by_alg": failures_by_alg,
+                "algorithms": metrics_by_alg,
+            }
+
+        # 将导航线指标写入 experiment_args，便于 HTML 底部与 JSON 归档统一（目标B工程化）
+        try:
+            if isinstance(getattr(self, "experiment_args", None), dict):
+                self.experiment_args["_navigation_metrics"] = self.navigation_meta
+        except Exception:
+            pass
+
+        # 终端摘要（便于日志复制与复现）
+        try:
+            if len(metrics_by_alg) > 1:
+                print("  nav-compare 指标摘要（mm）:")
+                for k in sorted(metrics_by_alg.keys()):
+                    m = metrics_by_alg.get(k) or {}
+                    wd = (m.get("wall_dist_mm") or {})
+                    print(
+                        f"    - {k}: "
+                        f"L={float(m.get('path_length_mm', 0.0)):.1f}, "
+                        f"Rmin={float(m.get('min_turn_radius_mm_estimated', 0.0)):.1f}, "
+                        f"dmin={(float(wd.get('d_min')) if wd.get('d_min') is not None else float('nan')):.2f}, "
+                        f"p05={(float(wd.get('d_p05')) if wd.get('d_p05') is not None else float('nan')):.2f}"
+                    )
+                sel = metrics_by_alg.get(selected_alg) or {}
+                wd2 = (sel.get("wall_dist_mm") or {})
+                print(
+                    f"  selected_algorithm={selected_alg} "
+                    f"(p05={(float(wd2.get('d_p05')) if wd2.get('d_p05') is not None else float('nan')):.2f}, "
+                    f"Rmin={float(sel.get('min_turn_radius_mm_estimated', 0.0)):.1f}, "
+                    f"L={float(sel.get('path_length_mm', 0.0)):.1f})"
+                )
+        except Exception:
+            pass
 
         try:
             sel = metrics_by_alg.get(selected_alg) or {}
@@ -3887,6 +4309,23 @@ class DicomTrachea3DPipeline:
                     "points_plotly": self.navigation_path_plotly.tolist(),
                     "meta": self.navigation_meta or {},
                 }
+                # 视频模式（方案 1）：将离线 MP4 与同步表注入 HTML，避免 file:// 下 fetch 被拦截
+                try:
+                    if output_html and isinstance(output_html, str):
+                        base = os.path.basename(output_html)
+                        if base.endswith(".html"):
+                            base = base[:-5]
+                        if "_3d_" in base:
+                            pref, ts2 = base.split("_3d_", 1)
+                            playable_mp4 = f"{pref}_flythrough_{ts2}_playable.mp4"
+                            playable_sync = f"{pref}_flythrough_{ts2}_playable_sync.json"
+                            sync_abs = os.path.join(os.path.dirname(output_html), playable_sync)
+                            if os.path.exists(sync_abs):
+                                with open(sync_abs, "r", encoding="utf-8") as sf:
+                                    nav_payload["video_sync"] = json.load(sf)
+                                nav_payload["video_mp4"] = playable_mp4
+                except Exception:
+                    pass
                 # 实验 1：只改相机（不改导航线）——离线预计算 cam.fwd/lookDist，注入 HTML 供 JS 使用
                 try:
                     from virtual_endoscopy_pyvista import compute_camera_hints  # noqa: WPS433
@@ -3947,8 +4386,40 @@ class DicomTrachea3DPipeline:
                     <button id='navCamPause' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:12px;'>暂停</button>
                     <button id='navCamReset' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:12px;'>重置视角</button>
                 </div>
-                <div style='margin:-2px 0 10px;font-size:11px;color:#94a3b8;line-height:1.45;'>播放时：相机<b>严格在导航线当前顶点</b>；对<b>视线方向</b>做一阶混合平滑（拖滑跳帧会立刻对齐 raw）；参考路径<b>前方第 3 个顶点</b>定 raw 方向；点<b>暂停</b>后可自由旋转、缩放。<br/>图例：<b>相机位置</b>（粉菱形）、<b>视线</b>（黄线段 eye→注视点）、<b>注视点</b>（橙十字）与 Plotly 相机一致。<br/><span style='color:#cbd5e1;'>更贴管腔：提高下方 JS 中 <code>navFwdFollow</code>（越接近 1 越跟折线、弯折处可能略抖）。</span></div>
-                <button id='navLumToggle' type='button' style='width:100%;margin-bottom:8px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#14532d;color:#ecfdf5;cursor:pointer;font-size:12px;font-weight:700;'>模式：腔外</button>
+                <div style='display:flex;gap:8px;flex-wrap:wrap;margin:-2px 0 10px;'>
+                    <button id='navVideoPlay' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#16a34a;color:#fff;cursor:pointer;font-size:12px;font-weight:700;'>播放（视频）</button>
+                    <button id='navVideoBack' type='button' style='flex:1;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e5e7eb;cursor:pointer;font-size:12px;'>返回交互</button>
+                </div>
+                <label style='display:flex;align-items:center;justify-content:space-between;gap:10px;margin:-2px 0 10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#cbd5e1;font-size:12px;'>
+                    <span>视频速度</span>
+                    <select id='navVideoRate' style='flex:1;max-width:180px;margin-left:10px;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;'>
+                        <option value='0.25'>0.25×（慢放4倍）</option>
+                        <option value='0.5'>0.5×</option>
+                        <option value='1.0'>1.0×</option>
+                    </select>
+                </label>
+                <div style='display:flex;align-items:center;justify-content:space-between;gap:10px;margin:-4px 0 10px;'>
+                    <div style='font-size:11px;color:#94a3b8;line-height:1.35;'>提示已收纳到问号中（按需展开）。</div>
+                    <div style='display:flex;gap:6px;'>
+                        <button id='navHelpVideoBtn' type='button' title='视频模式说明' style='width:26px;height:26px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:13px;line-height:1;'>?</button>
+                        <button id='navHelpCamBtn' type='button' title='漫游相机说明' style='width:26px;height:26px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:13px;line-height:1;'>?</button>
+                        <button id='navHelpParamBtn' type='button' title='参数说明' style='width:26px;height:26px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;cursor:pointer;font-size:13px;line-height:1;'>?</button>
+                    </div>
+                </div>
+                <div id='navHelpVideo' style='display:none;margin:-2px 0 10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#0f172a;font-size:11px;color:#cbd5e1;line-height:1.45;'>
+                    <b>视频模式</b>：离线 MP4 叠加覆盖在 3D 模型上播放；同步表会驱动路径帧/切片滚动。<br/>
+                    点<b>「返回交互」</b>：Plotly 相机会对齐到当前视频帧对应的导航点，视觉上像“视频停住并可环视”。
+                </div>
+                <div id='navHelpCam' style='display:none;margin:-2px 0 10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#0f172a;font-size:11px;color:#cbd5e1;line-height:1.45;'>
+                    <b>漫游相机</b>：eye 在路径点；视线方向做一阶平滑（减少抖动）；缺少离线提示量时回退“看前方若干点”。<br/>
+                    图例：相机位置（粉菱形）、视线（黄线段）、注视点（橙十字）。<br/>
+                    更贴管腔：提高 <code>navFwdFollow</code>（越接近 1 越跟折线，弯折处可能略抖）。
+                </div>
+                <div id='navHelpParam' style='display:none;margin:-2px 0 10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#0f172a;font-size:11px;color:#cbd5e1;line-height:1.45;'>
+                    <b>取点密度（插值倍数）</b>：1=原始点；更大=顶点间插点更密。倍数越大，总帧数越多；卡顿优先增大 ms。<br/>
+                    <b>掩码解释</b>：1=气腔（充气连通区域）；MC 网格是包绕气腔的壳。腔内模式下外表面常为背面。
+                </div>
+                <button id='navLumToggle' type='button' style='width:100%;margin-bottom:8px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#14532d;color:#ecfdf5;cursor:pointer;font-size:12px;font-weight:700;'>模式：融合</button>
                 <label style='display:flex;align-items:center;justify-content:space-between;gap:10px;margin:-2px 0 10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#cbd5e1;font-size:12px;'>
                     <span>气管配色</span>
                     <select id='navColorTheme' style='flex:1;max-width:180px;margin-left:10px;padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#111827;color:#e5e7eb;'>
@@ -3961,6 +4432,11 @@ class DicomTrachea3DPipeline:
                 </label>
                 <div id='navSliceMount' style='margin:0 0 10px;'></div>
                 <div id='navLumState' style='display:none;margin:-4px 0 10px;font-size:11px;color:#a7f3d0;line-height:1.35;'></div>
+                <div id='navCamBackend' style='margin:-4px 0 10px;padding:8px 10px;border-radius:10px;border:1px solid #334155;background:#0f172a;font-size:11px;color:#cbd5e1;line-height:1.35;'>
+                    相机更新：<b id='navCamBackendMode' style='color:#fff;'>—</b>
+                    <span style='color:#64748b;'>｜KF=<b id='navCamBackendKf' style='color:#e5e7eb;'>—</b></span>
+                    <span style='color:#64748b;'>（fast=<b id='navCamBackendFast'>0</b>, relayout=<b id='navCamBackendRelayout'>0</b>）</span>
+                </div>
                 <div style='margin-bottom:10px;'>
                     <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;font-size:12px;color:#cbd5e1;'>
                         <span>路径帧 <b id='navCamIdx'>0</b> / <b id='navCamIdxMax'>0</b></span>
@@ -3971,21 +4447,16 @@ class DicomTrachea3DPipeline:
                 </div>
                 <label style='display:flex;align-items:center;gap:10px;font-size:12px;color:#cbd5e1;'>
                     步进间隔 (ms)
-                    <input id='navCamMs' type='range' min='10' max='100' value='60' style='flex:1;' />
-                    <span id='navCamMsLbl'>60</span>
+                    <input id='navCamMs' type='range' min='10' max='100' value='10' step='1' style='flex:1;' />
+                    <span id='navCamMsLbl'>10</span>
                 </label>
                 <label style='display:flex;align-items:center;gap:10px;font-size:12px;color:#cbd5e1;margin-top:8px;'>
-                    点数降采样 (步长)
-                    <input id='navCamDs' type='range' min='1' max='6' value='1' style='flex:1;' />
-                    <span id='navCamDsLbl'>1</span>
+                    取点密度（插值倍数）
+                    <input id='navCamUp' type='range' min='1' max='6' value='1' step='1' style='flex:1;' />
+                    <span id='navCamUpLbl'>1</span>
                 </label>
-                <div style='margin-top:4px;font-size:11px;color:#94a3b8;line-height:1.35;'>
-                    用于帧率实验：步长=1 表示不降采样；步长=2 表示每 2 个点取 1 个（点数约减半）。<br/>
-                    注意：降采样会牺牲几何细节（可能略增贴壁/急拐），但能显著降低每帧 relayout 开销。
-                </div>
                 <div style='margin-top:6px;font-size:11px;color:#94a3b8;line-height:1.35;'>
-                    掩码体素 1 = <b>气腔（充气连通区域）</b>，不是软组织把心腔填实；MC 网格是包绕气腔的壳，相机在腔内时外表面常为背面。<br/>
-                    点<b>「腔内模式」</b>：隐藏「其他结构/气管外表面」，显示<b>反向法线内壁</b>并加粗导航线，便于腔内看壁形态。
+                    说明已移至上方 <b>?</b>（参数说明）。
                 </div>
             </div>
         </div>
@@ -4007,15 +4478,31 @@ class DicomTrachea3DPipeline:
                     var nav = window.__AIRWAY_NAVIGATION__;
                     if (!nav || !nav.points_plotly || nav.points_plotly.length < 2) return null;
                     var pts = nav.points_plotly;
-                    // 点数降采样（仅影响播放/滑块帧序，不改原始导航线 trace）
-                    var dsEl = document.getElementById('navCamDs');
-                    var ds = dsEl ? parseInt(dsEl.value, 10) : 1;
-                    if (!isFinite(ds) || ds < 1) ds = 1;
-                    if (ds <= 1) return pts;
+                    // 取点密度：对相邻顶点做线性插值（仅影响播放/滑块帧序，不改原始导航线 trace）
+                    var upEl = document.getElementById('navCamUp');
+                    var up = upEl ? parseInt(upEl.value, 10) : 1;
+                    if (!isFinite(up) || up < 1) up = 1;
+                    if (up > 12) up = 12; // 防止极端值导致 HTML 卡死
+                    if (up <= 1) {
+                        try { window.__NAV_DENSE_INFO__ = { up: 1, origN: pts.length }; } catch (e0) {}
+                        return pts;
+                    }
                     var out = [];
-                    for (var i = 0; i < pts.length; i += ds) out.push(pts[i]);
-                    // 确保最后一个点保留
-                    if (out.length >= 2 && out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+                    for (var i = 0; i < pts.length - 1; i++) {
+                        var a = pts[i];
+                        var b = pts[i + 1];
+                        out.push(a);
+                        for (var k = 1; k < up; k++) {
+                            var t = k / up;
+                            out.push([
+                                a[0] + (b[0] - a[0]) * t,
+                                a[1] + (b[1] - a[1]) * t,
+                                a[2] + (b[2] - a[2]) * t
+                            ]);
+                        }
+                    }
+                    out.push(pts[pts.length - 1]);
+                    try { window.__NAV_DENSE_INFO__ = { up: up, origN: pts.length }; } catch (e1) {}
                     return out;
                 } catch (e) { return null; }
             }
@@ -4062,10 +4549,144 @@ class DicomTrachea3DPipeline:
             var navLookDistMax = 25.0;
             // 冻结相机映射基准：避免某帧 axis range 变化导致 data->scene 映射跳变
             var navCamBasis = null;
+            // 方案 A：在页面加载后一次性预计算相机关键帧（减少每帧 JS 计算量）
+            // keyframes[i] = { ex,ey,ez,cx,cy,cz, eyeC:{x,y,z}, centerC:{x,y,z}, upC:{x,y,z} }
+            var navKeyframes = null;
+            var navKeyframesSig = null; // 用于检测 pts 变化（如插值倍数改变）
 
             function resetNavCameraSmooth() {
                 navSmFwd = null;
                 navLastIi = null;
+            }
+
+            function ptsSig(pts) {
+                try {
+                    if (!pts || !pts.length) return '0';
+                    // 只用 length + 首尾 z 做轻量签名，避免 O(N) 哈希
+                    var n = pts.length | 0;
+                    var z0 = pts[0] ? pts[0][2] : 0;
+                    var z1 = pts[n - 1] ? pts[n - 1][2] : 0;
+                    return String(n) + ':' + String(z0) + ':' + String(z1);
+                } catch (e) { return '0'; }
+            }
+
+            function buildKeyframes(pts) {
+                var gd = getGd();
+                if (!gd || !pts || pts.length < 2) return null;
+                var b = navCamBasis || getSceneCamBasisAny(gd);
+                if (!b) return null;
+                if (!navCamBasis) navCamBasis = b;
+                var cam = getCam();
+                var n = pts.length;
+                var frames = new Array(n);
+
+                // 先预计算每帧的 rawFwd + lookDist（数据坐标系），再做一遍低通平滑得到 smFwd
+                var rawFwdArr = new Array(n);
+                var lookArr = new Array(n);
+                var step = meanStep(pts);
+                var lookSegs = 3;
+
+                for (var ii = 0; ii < n; ii++) {
+                    var j = Math.min(n - 1, ii + lookSegs);
+                    var ex = pts[ii][0], ey = pts[ii][1], ez = pts[ii][2];
+                    var rawFwd = null;
+                    var preLook = null;
+
+                    if (cam && cam.fwd && cam.lookDist) {
+                        try {
+                            var info = window.__NAV_DENSE_INFO__ || null;
+                            var up = (info && info.up) ? Number(info.up) : 1;
+                            var origN = (info && info.origN) ? Number(info.origN) : cam.fwd.length;
+                            if (origN >= 2 && cam.fwd.length >= origN && cam.lookDist.length >= origN && up >= 2 && n === ((origN - 1) * up + 1)) {
+                                var seg = Math.floor(ii / up);
+                                if (seg < 0) seg = 0;
+                                if (seg > origN - 2) seg = origN - 2;
+                                var frac = (ii - seg * up) / up;
+                                if (frac < 0) frac = 0;
+                                if (frac > 1) frac = 1;
+                                var f0 = cam.fwd[seg];
+                                var f1 = cam.fwd[seg + 1];
+                                var d0 = cam.lookDist[seg];
+                                var d1 = cam.lookDist[seg + 1];
+                                if (f0 && f1 && f0.length >= 3 && f1.length >= 3) {
+                                    rawFwd = norm3([
+                                        (1 - frac) * f0[0] + frac * f1[0],
+                                        (1 - frac) * f0[1] + frac * f1[1],
+                                        (1 - frac) * f0[2] + frac * f1[2],
+                                    ]);
+                                }
+                                if (isFinite(d0) && isFinite(d1)) {
+                                    preLook = (1 - frac) * Number(d0) + frac * Number(d1);
+                                }
+                            } else if (cam.fwd.length > ii && cam.lookDist.length > ii) {
+                                rawFwd = norm3(cam.fwd[ii]);
+                                preLook = cam.lookDist[ii];
+                            }
+                        } catch (eMap) {}
+                    }
+
+                    if (!rawFwd) {
+                        var tx = pts[j][0], ty = pts[j][1], tz = pts[j][2];
+                        var rdx = tx - ex, rdy = ty - ey, rdz = tz - ez;
+                        var rdist = Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+                        if (rdist < 1e-4) {
+                            var fwb = tangentSmoothed(pts, Math.max(0, ii - 1), 8);
+                            tx = ex + fwb[0] * Math.max(step * 2.5, 1.2);
+                            ty = ey + fwb[1] * Math.max(step * 2.5, 1.2);
+                            tz = ez + fwb[2] * Math.max(step * 2.5, 1.2);
+                        }
+                        rawFwd = norm3([tx - ex, ty - ey, tz - ez]);
+                    }
+
+                    var lookDist = (preLook != null && isFinite(preLook)) ? Number(preLook) : Math.max(step * 3.5, 2.0);
+                    lookDist = Math.max(1.0, lookDist);
+                    if (isFinite(navLookDistMax) && navLookDistMax > 1.0) {
+                        lookDist = Math.min(lookDist, navLookDistMax);
+                    }
+
+                    rawFwdArr[ii] = rawFwd;
+                    lookArr[ii] = lookDist;
+                }
+
+                // 一阶平滑：得到 smFwd
+                var sm = null;
+                for (var i = 0; i < n; i++) {
+                    var rf = rawFwdArr[i] || [0, 0, 1];
+                    if (!sm) sm = rf.slice();
+                    else sm = blendDir(sm, rf, navFwdFollow);
+
+                    var ex2 = pts[i][0], ey2 = pts[i][1], ez2 = pts[i][2];
+                    var cx2 = ex2 + sm[0] * lookArr[i];
+                    var cy2 = ey2 + sm[1] * lookArr[i];
+                    var cz2 = ez2 + sm[2] * lookArr[i];
+
+                    var eyeC = dataPointToSceneCam([ex2, ey2, ez2], b);
+                    var centerC = dataPointToSceneCam([cx2, cy2, cz2], b);
+                    if (!eyeC || !centerC) {
+                        frames[i] = null;
+                        continue;
+                    }
+                    var fxc = centerC.x - eyeC.x, fyc = centerC.y - eyeC.y, fzc = centerC.z - eyeC.z;
+                    var upC = pickUp(fxc, fyc, fzc);
+                    frames[i] = { ex: ex2, ey: ey2, ez: ez2, cx: cx2, cy: cy2, cz: cz2, eyeC: eyeC, centerC: centerC, upC: upC };
+                }
+                return frames;
+            }
+
+            function ensureKeyframes(pts) {
+                var sig = ptsSig(pts);
+                if (navKeyframes && navKeyframesSig === sig) return navKeyframes;
+                navKeyframes = null;
+                navKeyframesSig = sig;
+                // 预计算可能耗时一点点，放在一次性 build
+                navKeyframes = buildKeyframes(pts);
+                try {
+                    __NAV_CAM_STATS__.kf_sig = sig;
+                    __NAV_CAM_STATS__.kf_on = !!(navKeyframes && navKeyframes.length);
+                    __NAV_CAM_STATS__.kf_n = navKeyframes ? (navKeyframes.length | 0) : 0;
+                    updateBackendUi(__NAV_CAM_STATS__.last);
+                } catch (e0) {}
+                return navKeyframes;
             }
 
             function blendDir(d0, d1, a) {
@@ -4347,6 +4968,309 @@ class DicomTrachea3DPipeline:
                 }
             }
 
+            // 方向 B：尽量绕开 Plotly.relayout 的 promise/布局链路
+            // 直接操作 gl3d scene 的内部相机对象并触发重绘（私有 API，不同 plotly 版本可能不一致）
+            function applyCameraFast(gd, eyeC, centerC, upC) {
+                try {
+                    if (!gd || !gd._fullLayout) return false;
+                    var sLayout = gd._fullLayout.scene;
+                    if (!sLayout) return false;
+                    var sc = sLayout._scene;
+                    if (!sc) return false;
+                    var camObj = {
+                        eye: { x: eyeC.x, y: eyeC.y, z: eyeC.z },
+                        center: { x: centerC.x, y: centerC.y, z: centerC.z },
+                        up: { x: upC.x, y: upC.y, z: upC.z }
+                    };
+                    // 尽量调用可用方法：setCamera / camera 赋值 / draw
+                    if (typeof sc.setCamera === 'function') {
+                        sc.setCamera(camObj);
+                    } else if (sc.camera) {
+                        sc.camera.eye = camObj.eye;
+                        sc.camera.center = camObj.center;
+                        sc.camera.up = camObj.up;
+                    } else {
+                        sc.camera = camObj;
+                    }
+                    // 触发重绘：不同版本可能是 draw / render / redraw
+                    if (typeof sc.draw === 'function') {
+                        sc.draw();
+                    } else if (typeof sc.render === 'function') {
+                        sc.render();
+                    } else if (typeof sc.redraw === 'function') {
+                        sc.redraw();
+                    } else {
+                        // 最差兜底：触发一次轻量 resize
+                        forceSceneRedraw(gd);
+                    }
+                    // 同步到 layout（便于外部读取当前相机；避免某些交互后跳变）
+                    try {
+                        if (!gd.layout) gd.layout = {};
+                        if (!gd.layout.scene) gd.layout.scene = {};
+                        if (!gd.layout.scene.camera) gd.layout.scene.camera = {};
+                        gd.layout.scene.camera.eye = JSON.parse(JSON.stringify(camObj.eye));
+                        gd.layout.scene.camera.center = JSON.parse(JSON.stringify(camObj.center));
+                        gd.layout.scene.camera.up = JSON.parse(JSON.stringify(camObj.up));
+                    } catch (e2) {}
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            // 在面板上显示“当前使用的相机更新后端” + keyframe 状态
+            var __NAV_CAM_STATS__ = {
+                fast_ok: 0,
+                relayout_fallback: 0,
+                last: '—',
+                kf_on: null,   // null/false/true
+                kf_n: 0,       // keyframe 数
+                kf_sig: null,  // pts 签名
+            };
+            function kfLabel() {
+                try {
+                    if (__NAV_CAM_STATS__.kf_on === true) return 'on(n=' + String(__NAV_CAM_STATS__.kf_n | 0) + ')';
+                    if (__NAV_CAM_STATS__.kf_on === false) return 'off';
+                    return '—';
+                } catch (e) { return '—'; }
+            }
+            function updateBackendUi(kind) {
+                try {
+                    __NAV_CAM_STATS__.last = String(kind || '—');
+                    var m = document.getElementById('navCamBackendMode');
+                    var kf = document.getElementById('navCamBackendKf');
+                    var f = document.getElementById('navCamBackendFast');
+                    var r = document.getElementById('navCamBackendRelayout');
+                    if (m) m.textContent = __NAV_CAM_STATS__.last;
+                    if (kf) kf.textContent = kfLabel();
+                    if (f) f.textContent = String(__NAV_CAM_STATS__.fast_ok | 0);
+                    if (r) r.textContent = String(__NAV_CAM_STATS__.relayout_fallback | 0);
+                } catch (e) {}
+            }
+
+            function applyCameraBackend(gd, eyeC, centerC, upC, patch) {
+                // 优先走内部相机更新（更快）；失败则回退到 relayout（更稳）
+                var fastOk = false;
+                try { fastOk = applyCameraFast(gd, eyeC, centerC, upC); } catch (ef) { fastOk = false; }
+                if (!fastOk) {
+                    __NAV_CAM_STATS__.relayout_fallback += 1;
+                    updateBackendUi('relayout');
+                    relayoutSceneCameraPatch(gd, patch);
+                } else {
+                    __NAV_CAM_STATS__.fast_ok += 1;
+                    updateBackendUi('fast(gl3d)');
+                }
+            }
+
+            // 视频模式（方案 1）：播放离线 MP4 + 同步到导航帧
+            var videoMode = false;
+            var videoSync = null; // { fps, frame_count, frame_to_nav_idx: [] }
+            var videoOverlay = null;
+            var videoEl = null;
+
+            function ensureVideoOverlay() {
+                try {
+                    if (videoOverlay && videoEl) return true;
+                    var gd = getGd();
+                    if (!gd) return false;
+                    // 用 fixed 覆盖：避免依赖 plotly 内部容器定位
+                    var ov = document.createElement('div');
+                    ov.id = 'navVideoOverlay';
+                    ov.style.position = 'fixed';
+                    ov.style.left = '0px';
+                    ov.style.top = '0px';
+                    ov.style.width = '0px';
+                    ov.style.height = '0px';
+                    ov.style.display = 'none';
+                    ov.style.zIndex = '9997'; // 低于面板 9998
+                    ov.style.pointerEvents = 'auto';
+                    ov.style.background = 'rgba(0,0,0,0.0)';
+
+                    var v = document.createElement('video');
+                    v.id = 'navVideo';
+                    v.controls = true;
+                    v.preload = 'auto';
+                    v.playsInline = true;
+                    v.style.width = '100%';
+                    v.style.height = '100%';
+                    v.style.borderRadius = '10px';
+                    v.style.background = '#000';
+                    v.style.boxShadow = '0 8px 30px rgba(0,0,0,0.55)';
+                    ov.appendChild(v);
+
+                    document.body.appendChild(ov);
+                    videoOverlay = ov;
+                    videoEl = v;
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            function placeVideoOverlay() {
+                try {
+                    if (!videoOverlay) return;
+                    var gd = getGd();
+                    if (!gd) return;
+                    var r = gd.getBoundingClientRect();
+                    // 覆盖 plotly 画布区域
+                    videoOverlay.style.left = Math.round(r.left) + 'px';
+                    videoOverlay.style.top = Math.round(r.top) + 'px';
+                    videoOverlay.style.width = Math.max(0, Math.round(r.width)) + 'px';
+                    videoOverlay.style.height = Math.max(0, Math.round(r.height)) + 'px';
+                } catch (e) {}
+            }
+
+            function currentRunBase() {
+                // 从当前 HTML 文件名推导出同目录下的 mp4/sync.json
+                // 约定：<prefix>_3d_<ts>.html -> <prefix>_flythrough_<ts>_playable.mp4 / ..._sync.json
+                try {
+                    var u = new URL(window.location.href);
+                    var fn = (u.pathname || '').split('/').pop() || '';
+                    if (!fn) return null;
+                    if (fn.toLowerCase().endsWith('.html')) fn = fn.slice(0, -5);
+                    // fn 形如 trachea_reconstruction_3d_YYYYmmdd_HHMMSS
+                    var p = fn.split('_3d_');
+                    if (p.length !== 2) return null;
+                    return { prefix: p[0], ts: p[1] };
+                } catch (e) { return null; }
+            }
+            function videoPaths() {
+                // 优先使用 Python 注入的路径（更可靠）
+                try {
+                    var nav = window.__AIRWAY_NAVIGATION__;
+                    if (nav && nav.video_mp4) {
+                        // sync 也优先内嵌；syncRel 仅作兜底
+                        var b0 = currentRunBase();
+                        var sync0 = null;
+                        if (b0) sync0 = b0.prefix + '_flythrough_' + b0.ts + '_playable_sync.json';
+                        return { mp4: String(nav.video_mp4), sync: sync0 };
+                    }
+                } catch (e0) {}
+                var b = currentRunBase();
+                if (!b) return null;
+                var mp4 = b.prefix + '_flythrough_' + b.ts + '_playable.mp4';
+                var sync = b.prefix + '_flythrough_' + b.ts + '_playable_sync.json';
+                return { mp4: mp4, sync: sync };
+            }
+            function loadVideoSync(syncRel) {
+                // 优先使用 HTML 内嵌（避免 file:// 下 fetch 被拦截）
+                try {
+                    var nav = window.__AIRWAY_NAVIGATION__;
+                    if (nav && nav.video_sync && nav.video_sync.frame_to_nav_idx) {
+                        videoSync = nav.video_sync;
+                        return Promise.resolve(videoSync);
+                    }
+                } catch (e0) {}
+                return fetch(syncRel, { cache: 'no-store' }).then(function(r) {
+                    if (!r.ok) throw new Error('sync fetch failed: ' + r.status);
+                    return r.json();
+                }).then(function(j) {
+                    videoSync = j;
+                    return j;
+                });
+            }
+            function navIdxFromVideoTime(t) {
+                if (!videoSync || !videoSync.fps || !videoSync.frame_to_nav_idx) return null;
+                var fps = Number(videoSync.fps);
+                if (!isFinite(fps) || fps <= 0) return null;
+                var fi = Math.floor(Number(t) * fps);
+                if (!isFinite(fi)) return null;
+                if (fi < 0) fi = 0;
+                var arr = videoSync.frame_to_nav_idx;
+                if (fi >= arr.length) fi = arr.length - 1;
+                var ni = arr[fi];
+                ni = (ni == null) ? null : (ni | 0);
+                return ni;
+            }
+
+            function navIdxToPtsIdx(ni, pts) {
+                // sync.json 里的 frame_to_nav_idx 是“原始导航点索引”（未插值）
+                // 前端播放 pts 可能是插值后的点列：需要 origIdx -> denseIdx 映射
+                try {
+                    if (ni == null) return null;
+                    if (!pts || !pts.length) return null;
+                    var info = window.__NAV_DENSE_INFO__ || null;
+                    var up = (info && info.up) ? Number(info.up) : 1;
+                    if (!isFinite(up) || up < 1) up = 1;
+                    var ii = (up <= 1) ? (ni | 0) : ((ni | 0) * up);
+                    if (ii < 0) ii = 0;
+                    if (ii >= pts.length) ii = pts.length - 1;
+                    return ii;
+                } catch (e) { return null; }
+            }
+            function syncUiToNavIdx(pts, ni) {
+                if (!pts || !pts.length || ni == null) return;
+                var ii = navIdxToPtsIdx(ni, pts);
+                if (ii == null) return;
+                // 同步滑块/标签/切片（不触发相机更新，避免视频模式下额外渲染负担）
+                syncPathUi(pts, ii);
+            }
+            function enterVideoMode() {
+                var vp = videoPaths();
+                if (!vp) return;
+                if (!ensureVideoOverlay()) return;
+                stop();
+                videoMode = true;
+                try { updateBackendUi(__NAV_CAM_STATS__.last); } catch (e0) {}
+                placeVideoOverlay();
+                videoOverlay.style.display = 'block';
+                // 视频模式显示时允许交互控件点击；隐藏时不拦截鼠标
+                try { videoOverlay.style.pointerEvents = 'auto'; } catch (ePE0) {}
+                videoEl.src = vp.mp4;
+                // 加载同步表（方案 S）；失败则允许播放但不同步
+                loadVideoSync(vp.sync).catch(function() { videoSync = null; });
+                // timeupdate 同步（轻量）
+                function syncFromVideo() {
+                    try {
+                        var pts = getPts();
+                        if (!pts) return;
+                        var ni = navIdxFromVideoTime(videoEl.currentTime);
+                        syncUiToNavIdx(pts, ni);
+                    } catch (e) {}
+                }
+                videoEl.ontimeupdate = syncFromVideo;
+                // 拖动进度条时通常触发 seeked（不一定马上触发 timeupdate）
+                videoEl.onseeked = syncFromVideo;
+                videoEl.onloadedmetadata = syncFromVideo;
+                videoEl.onpause = function() {
+                    // 暂停不自动切回交互，由用户点“返回交互”
+                };
+                // 覆盖层随窗口变化更新位置
+                try {
+                    window.addEventListener('resize', placeVideoOverlay);
+                    window.addEventListener('scroll', placeVideoOverlay, true);
+                } catch (e2) {}
+                // 默认慢放4倍（可在面板中改）
+                try {
+                    var rateSel = document.getElementById('navVideoRate');
+                    var rate = rateSel ? Number(rateSel.value) : 0.25;
+                    if (!isFinite(rate) || rate <= 0) rate = 0.25;
+                    videoEl.playbackRate = rate;
+                } catch (eR0) {}
+                try { videoEl.play(); } catch (e1) {}
+            }
+            function backToInteractive() {
+                var pts = getPts();
+                if (!videoEl) return;
+                var ni = null;
+                try { ni = navIdxFromVideoTime(videoEl.currentTime); } catch (e0) { ni = null; }
+                try { videoEl.pause(); } catch (e1) {}
+                if (videoOverlay) videoOverlay.style.display = 'none';
+                try { if (videoOverlay) videoOverlay.style.pointerEvents = 'none'; } catch (ePE1) {}
+                videoMode = false;
+                if (pts && ni != null) {
+                    var ii = navIdxToPtsIdx(ni, pts);
+                    if (ii == null) return;
+                    idx = Math.max(0, Math.min(pts.length - 1, ii | 0));
+                    syncPathUi(pts, idx);
+                    applyCameraForIndex(pts, idx);
+                    // 关键：切回交互后强制触发一次重绘，避免出现“图例正常但画面空白”
+                    try { forceSceneRedraw(getGd()); } catch (eRD0) {}
+                    setTimeout(function() { try { forceSceneRedraw(getGd()); } catch (eRD1) {} }, 60);
+                }
+            }
+
             // Plotly scene.camera 的 eye/center/up 在「场景域坐标」中：(0,0,0) 为数据包围盒中心，
             // 量级约与默认 eye=(1.25,1.25,1.25) 相当；不能把导航点的数据坐标(mm/像素)直接写入，否则会白屏。
             function getSceneCamBasis(gd) {
@@ -4438,7 +5362,7 @@ class DicomTrachea3DPipeline:
                         patch['scene.camera.projection'] = JSON.parse(JSON.stringify(oldCam.projection));
                     }
                 } catch (ep) {}
-                relayoutSceneCameraPatch(gd, patch);
+                applyCameraBackend(gd, eyeC, centerC, up, patch);
                 // 腔内模式下：动态 headlight（随相机更新）
                 if (luminalOn) {
                     updateInnerWallHeadlight(gd, ex, ey, ez, cx, cy, cz);
@@ -4451,6 +5375,29 @@ class DicomTrachea3DPipeline:
                 var cam = getCam();
                 var n = pts.length;
                 var ii = Math.max(0, Math.min(n - 1, i | 0));
+                // 方案 A：若已预计算关键帧，则每帧只做数组读取 + relayout
+                var kfs = null;
+                try { kfs = ensureKeyframes(pts); } catch (ek) { kfs = null; }
+                if (kfs && kfs.length === n && kfs[ii]) {
+                    var fr = kfs[ii];
+                    updateNavDebugOverlays(gd, fr.ex, fr.ey, fr.ez, fr.cx, fr.cy, fr.cz);
+                    if (!skipRelayout) {
+                        var oldCam = (gd.layout && gd.layout.scene && gd.layout.scene.camera) ? gd.layout.scene.camera : {};
+                        var patch = {
+                            'scene.camera.eye': { x: fr.eyeC.x, y: fr.eyeC.y, z: fr.eyeC.z },
+                            'scene.camera.center': { x: fr.centerC.x, y: fr.centerC.y, z: fr.centerC.z },
+                            'scene.camera.up': { x: fr.upC.x, y: fr.upC.y, z: fr.upC.z }
+                        };
+                        try {
+                            if (oldCam && oldCam.projection) {
+                                patch['scene.camera.projection'] = JSON.parse(JSON.stringify(oldCam.projection));
+                            }
+                        } catch (ep0) {}
+                        applyCameraBackend(gd, fr.eyeC, fr.centerC, fr.upC, patch);
+                        if (luminalOn) updateInnerWallHeadlight(gd, fr.ex, fr.ey, fr.ez, fr.cx, fr.cy, fr.cz);
+                    }
+                    return;
+                }
                 var step = meanStep(pts);
                 var lookLen = Math.max(step * 2.5, 1.2);
                 var lookSegs = 3;
@@ -4460,10 +5407,38 @@ class DicomTrachea3DPipeline:
                 var rawEz = pts[ii][2];
                 var rawFwd = null;
                 var preLook = null;
-                if (cam && cam.fwd && cam.lookDist && cam.fwd.length > ii && cam.lookDist.length > ii) {
-                    // 射线约束看向（离线预计算）：优先使用 cam.fwd/lookDist
-                    rawFwd = norm3(cam.fwd[ii]);
-                    preLook = cam.lookDist[ii];
+                if (cam && cam.fwd && cam.lookDist) {
+                    // 射线约束看向（离线预计算）：原始点列长度可能与插值后 pts 不一致 → 做索引映射 + 线性插值
+                    try {
+                        var info = window.__NAV_DENSE_INFO__ || null;
+                        var up = (info && info.up) ? Number(info.up) : 1;
+                        var origN = (info && info.origN) ? Number(info.origN) : cam.fwd.length;
+                        if (origN >= 2 && cam.fwd.length >= origN && cam.lookDist.length >= origN && up >= 2 && n === ((origN - 1) * up + 1)) {
+                            var seg = Math.floor(ii / up);
+                            if (seg < 0) seg = 0;
+                            if (seg > origN - 2) seg = origN - 2;
+                            var frac = (ii - seg * up) / up;
+                            if (frac < 0) frac = 0;
+                            if (frac > 1) frac = 1;
+                            var f0 = cam.fwd[seg];
+                            var f1 = cam.fwd[seg + 1];
+                            var d0 = cam.lookDist[seg];
+                            var d1 = cam.lookDist[seg + 1];
+                            if (f0 && f1 && f0.length >= 3 && f1.length >= 3) {
+                                rawFwd = norm3([
+                                    (1 - frac) * f0[0] + frac * f1[0],
+                                    (1 - frac) * f0[1] + frac * f1[1],
+                                    (1 - frac) * f0[2] + frac * f1[2],
+                                ]);
+                            }
+                            if (isFinite(d0) && isFinite(d1)) {
+                                preLook = (1 - frac) * Number(d0) + frac * Number(d1);
+                            }
+                        } else if (cam.fwd.length > ii && cam.lookDist.length > ii) {
+                            rawFwd = norm3(cam.fwd[ii]);
+                            preLook = cam.lookDist[ii];
+                        }
+                    } catch (eMap) {}
                 } else {
                     // 回退：前方第 lookSegs 个顶点作为注视方向
                     var tx = pts[j][0];
@@ -4604,6 +5579,15 @@ class DicomTrachea3DPipeline:
                 var play = document.getElementById('navCamPlay');
                 var pause = document.getElementById('navCamPause');
                 var reset = document.getElementById('navCamReset');
+                var vPlay = document.getElementById('navVideoPlay');
+                var vBack = document.getElementById('navVideoBack');
+                var vRate = document.getElementById('navVideoRate');
+                var hVideoBtn = document.getElementById('navHelpVideoBtn');
+                var hCamBtn = document.getElementById('navHelpCamBtn');
+                var hParamBtn = document.getElementById('navHelpParamBtn');
+                var hVideo = document.getElementById('navHelpVideo');
+                var hCam = document.getElementById('navHelpCam');
+                var hParam = document.getElementById('navHelpParam');
                 var ms = document.getElementById('navCamMs');
                 var msLbl = document.getElementById('navCamMsLbl');
                 var ds = document.getElementById('navCamDs');
@@ -4612,22 +5596,41 @@ class DicomTrachea3DPipeline:
                 if (play) play.addEventListener('click', start);
                 if (pause) pause.addEventListener('click', stop);
                 if (reset) reset.addEventListener('click', resetCam);
+                if (vPlay) vPlay.addEventListener('click', function() { enterVideoMode(); });
+                if (vBack) vBack.addEventListener('click', function() { backToInteractive(); });
+                if (vRate) vRate.addEventListener('change', function() {
+                    try {
+                        if (videoEl) {
+                            var rr = Number(vRate.value);
+                            if (isFinite(rr) && rr > 0) videoEl.playbackRate = rr;
+                        }
+                    } catch (e) {}
+                });
+                function hideAllHelp() {
+                    try {
+                        if (hVideo) hVideo.style.display = 'none';
+                        if (hCam) hCam.style.display = 'none';
+                        if (hParam) hParam.style.display = 'none';
+                    } catch (e) {}
+                }
+                function toggleHelp(which) {
+                    try {
+                        var el = (which === 'video') ? hVideo : (which === 'cam') ? hCam : hParam;
+                        if (!el) return;
+                        var on = (el.style.display !== 'none');
+                        hideAllHelp();
+                        el.style.display = on ? 'none' : 'block';
+                    } catch (e) {}
+                }
+                if (hVideoBtn) hVideoBtn.addEventListener('click', function() { toggleHelp('video'); });
+                if (hCamBtn) hCamBtn.addEventListener('click', function() { toggleHelp('cam'); });
+                if (hParamBtn) hParamBtn.addEventListener('click', function() { toggleHelp('param'); });
                 if (ms && msLbl) {
                     ms.addEventListener('input', function() { msLbl.textContent = String(ms.value); });
+                    // 初始化 label：保证打开 HTML 时显示与默认 value 一致
+                    try { msLbl.textContent = String(ms.value); } catch (e0) {}
                 }
-                if (ds && dsLbl) {
-                    ds.addEventListener('input', function() {
-                        dsLbl.textContent = String(ds.value);
-                        // 变更点数 → 立即暂停并刷新 UI 边界
-                        stop();
-                        var pts = getPts();
-                        if (pts) {
-                            idx = Math.max(0, Math.min(idx, pts.length - 1));
-                            syncPathUi(pts, idx);
-                            applyCameraForIndex(pts, idx);
-                        }
-                    });
-                }
+                // 兼容旧 HTML：若存在降采样控件则忽略（但不报错）
                 if (path) {
                     path.addEventListener('input', function() {
                         var pts = getPts();
@@ -4638,6 +5641,27 @@ class DicomTrachea3DPipeline:
                         applyCameraForIndex(pts, idx);
                         syncPathUi(pts, idx);
                     });
+                }
+                var upEl = document.getElementById('navCamUp');
+                var upLbl = document.getElementById('navCamUpLbl');
+                if (upEl && upLbl) {
+                    upEl.addEventListener('input', function() {
+                        upLbl.textContent = String(upEl.value);
+                        // 变更取点密度 → 立即暂停并刷新 UI 边界
+                        stop();
+                        resetNavCameraSmooth();
+                        // 插值倍数改变会导致 pts 序列变化：需要重建 keyframes
+                        navKeyframes = null;
+                        navKeyframesSig = null;
+                        var pts = getPts();
+                        if (pts) {
+                            idx = Math.max(0, Math.min(idx, pts.length - 1));
+                            syncPathUi(pts, idx);
+                            applyCameraForIndex(pts, idx);
+                        }
+                    });
+                    // 初始化 label：保证打开 HTML 时显示与默认 value 一致
+                    try { upLbl.textContent = String(upEl.value); } catch (e1) {}
                 }
                 var lumBtn = document.getElementById('navLumToggle');
                 if (lumBtn) lumBtn.addEventListener('click', function() { applyViewMode((viewMode + 1) % 3); });
@@ -4687,12 +5711,18 @@ class DicomTrachea3DPipeline:
                     if (g2 && p2 && p2.length) applyCameraForIndex(p2, 0, true);
                 }, 300);
                 wire();
+                // 方案 A：预计算关键帧（首次打开时做一次，播放时复用）
+                try { ensureKeyframes(getPts()); } catch (eKF) {}
+                // 初始化“相机更新后端”显示
+                try { updateBackendUi(__NAV_CAM_STATS__.last); } catch (eInit) {}
                 // 初始化模式 UI（默认：腔外）
                 applyViewMode(viewMode);
                 // 载入配色主题
                 loadTheme();
                 // 对外暴露：切片浏览器等交互触发时暂停播放
                 try { window.__NAV_CAM_STOP__ = stop; } catch (e) {}
+                // 对外暴露：便于在控制台查看统计
+                try { window.__NAV_CAM_STATS__ = __NAV_CAM_STATS__; } catch (e2) {}
             }
 
             if (document.readyState === 'loading') {
@@ -5123,9 +6153,19 @@ class DicomTrachea3DPipeline:
             # 多算法对比：按算法分组展示
             if isinstance(nav_metrics.get("algorithms"), dict):
                 sel = nav_metrics.get("selected_algorithm", None)
+                fail_map = nav_metrics.get("failures_by_alg", None) if isinstance(nav_metrics, dict) else None
                 blocks = []
                 for alg_name, mm in (nav_metrics.get("algorithms") or {}).items():
-                    tag = "（已选用/用于漫游）" if (sel is not None and str(alg_name) == str(sel)) else ""
+                    tag_main = "（已选用/用于漫游）" if (sel is not None and str(alg_name) == str(sel)) else ""
+                    tag_fail = ""
+                    try:
+                        if isinstance(fail_map, dict):
+                            fi = fail_map.get(str(alg_name), None)
+                            if isinstance(fi, dict) and (fi.get("ok", True) is False):
+                                tag_fail = "（失败/不可用）"
+                    except Exception:
+                        tag_fail = ""
+                    tag = (tag_main + tag_fail) if (tag_main or tag_fail) else ""
                     blocks.append(
                         f"<tr style='background:#0f1a2e;'><td colspan='3' style='padding:10px 12px;border-bottom:1px solid #243244;color:#f8fafc;font-weight:900;'>算法: {alg_name}{tag}</td></tr>"
                     )
@@ -5221,9 +6261,55 @@ class DicomTrachea3DPipeline:
                 print("\n" + "=" * 60)
                 print("PyVista 虚拟内镜（离屏 MP4）")
                 print("=" * 60)
-                okv = export_from_pipeline(self, vtk_flythrough_mp4)
+                # 约定：离线视频以 60fps 渲染（同步更细），前端默认以 0.25 倍速播放实现“慢放 4 倍”
+                okv = export_from_pipeline(self, vtk_flythrough_mp4, fps=60)
                 if okv and output_html:
                     print(f"  可与 HTML 对照: {output_html}")
+                    # 视频同步（方案 S）：在视频导出完成后，将 sync.json 直接回写注入 HTML（避免 file:// 下 fetch 被拦截）
+                    try:
+                        mp4_abs = str(vtk_flythrough_mp4)
+                        playable_mp4_abs = mp4_abs[:-4] + "_playable.mp4" if mp4_abs.lower().endswith(".mp4") else (mp4_abs + "_playable.mp4")
+                        playable_sync_abs = playable_mp4_abs[:-4] + "_sync.json" if playable_mp4_abs.lower().endswith(".mp4") else (playable_mp4_abs + "_sync.json")
+                        if os.path.exists(playable_sync_abs):
+                            with open(playable_sync_abs, "r", encoding="utf-8") as sf:
+                                sync_obj = json.load(sf)
+                            rel_mp4 = os.path.basename(playable_mp4_abs)
+                            payload_script = (
+                                "\n<!-- NAV_VIDEO_SYNC_INJECT -->\n"
+                                "<script>\n"
+                                "(function(){\n"
+                                "  try {\n"
+                                "    window.__AIRWAY_NAVIGATION__ = window.__AIRWAY_NAVIGATION__ || {};\n"
+                                "    window.__AIRWAY_NAVIGATION__.video_mp4 = "
+                                + json.dumps(rel_mp4, ensure_ascii=False)
+                                + ";\n"
+                                "    window.__AIRWAY_NAVIGATION__.video_sync = "
+                                + json.dumps(sync_obj, ensure_ascii=False)
+                                + ";\n"
+                                "  } catch(e) {}\n"
+                                "})();\n"
+                                "</script>\n"
+                            )
+                            try:
+                                with open(output_html, "r", encoding="utf-8") as hf:
+                                    html0 = hf.read()
+                                # 若重复注入，先移除旧块
+                                if "<!-- NAV_VIDEO_SYNC_INJECT -->" in html0:
+                                    parts = html0.split("<!-- NAV_VIDEO_SYNC_INJECT -->")
+                                    html0 = parts[0]  # 保留首次注入前内容
+                                    # 尝试保留 </body> 之后尾巴（一般没有）；简单补回 </body>...不需要
+                                    if "</body>" not in html0 and len(parts) > 1:
+                                        # 若 split 破坏了 </body>，则退回不做清理
+                                        pass
+                                if "</body>" in html0:
+                                    html1 = html0.replace("</body>", payload_script + "</body>")
+                                    with open(output_html, "w", encoding="utf-8") as hf2:
+                                        hf2.write(html1)
+                                    print(f"✓ 已回写注入视频同步到 HTML: {os.path.basename(output_html)}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"⚠ 虚拟内镜 MP4 导出失败: {e}")
         
@@ -5327,7 +6413,7 @@ def main():
     parser.add_argument('--nav-min-radius', type=float, default=12.0,
                        help='导航线最小转弯半径(mm)约束的目标值(默认: 12.0)')
     parser.add_argument('--nav-algorithm', type=str, default='skeleton_dijkstra',
-                       choices=['skeleton_dijkstra', 'dt_ridge'],
+                      choices=['skeleton_dijkstra', 'dt_ridge', 'astar_cost', 'fast_marching', 'teasar'],
                        help='导航线算法(默认: skeleton_dijkstra；dt_ridge 为传统DT峰值基线)')
     parser.add_argument('--nav-compare', action='store_true',
                        help='同时计算并叠加绘制多种导航线算法（当前: skeleton_dijkstra vs dt_ridge），并在实验信息底部按算法分组输出指标')
@@ -5416,12 +6502,26 @@ def main():
     pipeline.experiment_intro = args.intro or ""
     pipeline.experiment_args = vars(args).copy()
     pipeline.experiment_started_at = datetime.datetime.now()
+    # 输出目录信息也纳入实验参数，便于产物与 run_dir 互相指认
+    try:
+        pipeline.experiment_args["_run_dir"] = os.path.abspath(str(run_dir))
+        pipeline.experiment_args["_output_html"] = os.path.abspath(str(output_html)) if output_html else None
+    except Exception:
+        pass
     pipeline.expand_cfg = {
         "enabled": bool(args.expand_trachea),
         "threshold": args.expand_threshold,
         "max_iters": int(args.expand_max_iters),
         "min_dist_mm": float(args.expand_min_dist_mm),
     }
+
+    # 运行参数落盘（工程化可复现）：每次 run 目录写一份 args 快照
+    try:
+        run_args_json = os.path.join(run_dir, "run_args.json")
+        with open(run_args_json, "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
     # simple-3d：仅预览，不进入完整流程
     if args.simple_3d:
@@ -5458,6 +6558,65 @@ def main():
         nav_compare=args.nav_compare,
         vtk_flythrough_mp4=fly_mp4,
     )
+
+    # 运行产物最小集（工程化可复现）：参数+指标统一落盘到 run_metrics.json
+    try:
+        ended_at = datetime.datetime.now()
+        safe_args = {}
+        for k, v in (pipeline.experiment_args or {}).items():
+            try:
+                json.dumps(v, ensure_ascii=False)
+                safe_args[k] = v
+            except Exception:
+                safe_args[k] = str(v)
+        safe_args["_internal"] = {
+            "percentile": pipeline.percentile,
+            "roi_size": pipeline.roi_size,
+            "kernel_size": list(pipeline.kernel_size) if isinstance(pipeline.kernel_size, tuple) else pipeline.kernel_size,
+            "2d_morph": "dilate(iter=1)",
+            "3d_closing_iterations": pipeline.closing_iters,
+            "3d_erosion_iterations": pipeline.erosion_iters,
+        }
+        if getattr(pipeline, "navigation_meta", None):
+            safe_args["_navigation_metrics"] = pipeline.navigation_meta
+
+        # 输入指纹（工程化可复现）：用于判断“是否同一份输入/同一份掩码/同一份几何尺度”
+        try:
+            dz_mm, dy_mm, dx_mm = pipeline._estimate_spacing_mm()
+        except Exception:
+            dz_mm, dy_mm, dx_mm = None, None, None
+        try:
+            m3d = getattr(pipeline, "trachea_mask_3d", None)
+            if m3d is not None:
+                m_sum = int(np.sum(m3d > 0))
+                m_shape = list(m3d.shape)
+                m_dtype = str(getattr(m3d, "dtype", ""))
+            else:
+                m_sum, m_shape, m_dtype = None, None, None
+        except Exception:
+            m_sum, m_shape, m_dtype = None, None, None
+        safe_args["_input_fingerprint"] = {
+            "dicom_dir": os.path.abspath(str(args.dicom)) if args.dicom is not None else None,
+            "z_min": float(args.z_min) if args.z_min is not None else None,
+            "z_max": float(args.z_max) if args.z_max is not None else None,
+            "seed": {"start_z": float(args.start_z) if args.start_z is not None else None, "start_idx": int(args.start_idx) if args.start_idx is not None else None},
+            "spacing_mm": {"dz": float(dz_mm) if dz_mm is not None else None, "dy": float(dy_mm) if dy_mm is not None else None, "dx": float(dx_mm) if dx_mm is not None else None},
+            "mask_3d": {"shape": m_shape, "sum": m_sum, "dtype": m_dtype},
+            "downsample_size": int(args.size) if args.size is not None else None,
+            "iso_value": float(args.iso) if args.iso is not None else None,
+            "step_size": int(args.step) if args.step is not None else None,
+        }
+        safe_args["_run"] = {
+            "started_at": pipeline.experiment_started_at.strftime("%Y-%m-%d %H:%M:%S") if isinstance(getattr(pipeline, "experiment_started_at", None), datetime.datetime) else None,
+            "ended_at": ended_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "output_html": os.path.basename(output_html) if output_html else None,
+            "success": bool(success),
+        }
+        run_metrics_json = os.path.join(run_dir, "run_metrics.json")
+        with open(run_metrics_json, "w", encoding="utf-8") as f:
+            json.dump(safe_args, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     
     return 0 if success else 1
 

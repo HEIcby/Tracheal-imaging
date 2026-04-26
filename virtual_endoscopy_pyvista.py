@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from typing import Optional, Tuple
 
+import json
 import numpy as np
 
 
@@ -208,10 +209,30 @@ def export_flythrough_mp4(
 
     verts = np.asarray(verts, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
-    path = _resample_polyline(np.asarray(path_xyz, dtype=np.float64), step_mm)
+    orig_path = np.asarray(path_xyz, dtype=np.float64)
+    path = _resample_polyline(orig_path, step_mm)
     if len(path) < 3:
         print("✗ 虚拟内镜: 路径点数不足")
         return False
+
+    # 同步（方案 S）：为每个视频帧生成对应的“原始路径点索引”（用于 HTML 对齐导航滑块）
+    # - export_flythrough_mp4 内部会对路径做重采样以获得更平滑的运动；因此需要将重采样帧映射回 orig_path 的索引。
+    def _cumlen(p: np.ndarray) -> np.ndarray:
+        if p is None or len(p) < 2:
+            return np.zeros((0,), dtype=np.float64)
+        seg = np.linalg.norm(np.diff(p, axis=0), axis=1)
+        return np.concatenate([[0.0], np.cumsum(seg.astype(np.float64))])
+
+    nav_idx_map: Optional[np.ndarray] = None
+    try:
+        s_orig = _cumlen(orig_path)
+        s_res = _cumlen(path)
+        if len(s_orig) >= 2 and len(s_res) >= 2 and float(s_orig[-1]) > 1e-9:
+            # s_res -> idx_float in [0, orig_n-1]
+            idx_float = np.interp(s_res, s_orig, np.arange(len(s_orig), dtype=np.float64))
+            nav_idx_map = np.clip(np.rint(idx_float), 0, len(s_orig) - 1).astype(np.int32)
+    except Exception:
+        nav_idx_map = None
 
     n_faces = faces.shape[0]
     f_flat = np.empty(n_faces * 4, dtype=np.int64)
@@ -285,6 +306,26 @@ def export_flythrough_mp4(
     plotter.close()
     print(f"✓ PyVista 虚拟内镜 MP4 已保存: {output_mp4}")
 
+    # 输出同步 JSON（与视频同目录同前缀）
+    sync_payload = None
+    try:
+        if nav_idx_map is not None and len(nav_idx_map) == n:
+            sync_payload = {
+                "fps": int(fps),
+                "frame_count": int(n),
+                "nav_n": int(orig_path.shape[0]),
+                "resampled_n": int(n),
+                "step_mm": float(step_mm),
+                "frame_to_nav_idx": nav_idx_map.tolist(),
+            }
+            sync_json = output_mp4[:-4] + "_sync.json" if output_mp4.lower().endswith(".mp4") else (output_mp4 + "_sync.json")
+            with open(sync_json, "w", encoding="utf-8") as f:
+                json.dump(sync_payload, f, ensure_ascii=False)
+            print(f"✓ 同步 JSON 已保存: {sync_json}")
+    except Exception:
+        # 同步文件属于增强能力：失败不影响 mp4 产出
+        sync_payload = None
+
     # 某些播放器无法播放 High 4:4:4 Predictive 等编码配置；额外输出一个更通用的版本
     playable = None
     if output_mp4.lower().endswith(".mp4"):
@@ -292,6 +333,15 @@ def export_flythrough_mp4(
     if playable and playable != output_mp4:
         if _reencode_playable_h264(output_mp4, playable, crf=18, fps=int(fps)):
             print(f"✓ 兼容版 MP4 已保存: {playable}")
+            # 同步 JSON 也复制一份给 playable（HTML 默认更倾向使用 _playable.mp4）
+            try:
+                if sync_payload is not None and playable.lower().endswith(".mp4"):
+                    playable_sync = playable[:-4] + "_sync.json"
+                    with open(playable_sync, "w", encoding="utf-8") as f:
+                        json.dump(sync_payload, f, ensure_ascii=False)
+                    print(f"✓ 同步 JSON（兼容版）已保存: {playable_sync}")
+            except Exception:
+                pass
         else:
             print("⚠ 未能生成兼容版 MP4（可忽略；如无法播放请手动用 ffmpeg 转码为 yuv420p）")
     return True

@@ -54,6 +54,28 @@
 }
 ```
 
+### 视频模式自检（已验证可用）
+
+- 说明：导出 MP4 + `*_sync.json`，并回写注入到 HTML，用于验证“视频模式/严格同步/返回交互对齐”等目标1能力。
+
+```bash
+python dicom_trachea_complete.py --dicom .\dicom2 --output trachea_reconstruction --size 256 --iso 0.5 --step 2 --fixed-threshold 0.33 --closing-iters 2 --erosion-iters 1 --z-min -200 --z-max -68 --section-interval 20 --use-3d-analysis --start-z -192.4 --navigation-line --nav-min-radius 12 --expand-by-shell --expand-threshold 0.5 --expand-max-iters 200 --expand-min-dist-mm 1.0 --vtk-flythrough --no-open
+```
+
+- 代表性产物（本次已回归验证通过）：
+  - `output/20260426_231505/trachea_reconstruction_3d_20260426_231505.html`
+  - `output/20260426_231505/trachea_reconstruction_flythrough_20260426_231505_playable.mp4`
+  - `output/20260426_231505/trachea_reconstruction_flythrough_20260426_231505_playable_sync.json`
+
+### 多路径算法对比（nav-compare，已验证可用）
+
+```bash
+python dicom_trachea_complete.py --dicom .\dicom2 --output trachea_reconstruction --size 256 --iso 0.5 --step 2 --fixed-threshold 0.33 --closing-iters 2 --erosion-iters 1 --z-min -200 --z-max -68 --section-interval 20 --use-3d-analysis --start-z -192.4 --navigation-line --nav-min-radius 12 --nav-compare --expand-by-shell --expand-threshold 0.5 --expand-max-iters 200 --expand-min-dist-mm 1.0 --no-open
+```
+
+- 代表性产物（含 `run_args.json/run_metrics.json`）：
+  - `output/20260426_225431/run_metrics.json`
+
 ---
 
 ## `dicom1`（已确认可行）
@@ -104,6 +126,26 @@
 }
 ```
 
+### 视频模式自检（已验证可用）
+
+```bash
+python dicom_trachea_complete.py --dicom .\dicom1 --output trachea_reconstruction --size 256 --iso 0.5 --step 2 --fixed-threshold 0.33 --closing-iters 2 --erosion-iters 1 --z-min -100 --z-max 50 --section-interval 15 --use-3d-analysis --start-z -89 --navigation-line --nav-min-radius 12 --expand-by-shell --expand-max-iters 200 --expand-min-dist-mm 0.0 --vtk-flythrough --no-open
+```
+
+- 代表性产物（本次已回归验证通过）：
+  - `output/20260426_231205/trachea_reconstruction_3d_20260426_231205.html`
+  - `output/20260426_231205/trachea_reconstruction_flythrough_20260426_231205_playable.mp4`
+  - `output/20260426_231205/trachea_reconstruction_flythrough_20260426_231205_playable_sync.json`
+
+### 多路径算法对比（nav-compare，已验证可用）
+
+```bash
+python dicom_trachea_complete.py --dicom .\dicom1 --output trachea_reconstruction --size 256 --iso 0.5 --step 2 --fixed-threshold 0.33 --closing-iters 2 --erosion-iters 1 --z-min -100 --z-max 50 --section-interval 15 --use-3d-analysis --start-z -89 --navigation-line --nav-min-radius 12 --nav-compare --no-cross-sections --expand-by-shell --expand-max-iters 200 --expand-min-dist-mm 0.0 --no-open
+```
+
+- 代表性产物（含 `run_args.json/run_metrics.json`）：
+  - `output/20260426_230128/run_metrics.json`
+
 ---
 
 ## `dicom3`（已确认可行）
@@ -153,3 +195,23 @@
   }
 }
 ```
+
+### 视频模式自检（已验证可用）
+
+```bash
+python dicom_trachea_complete.py --dicom .\dicom3 --output trachea_reconstruction --size 512 --iso 0.5 --step 2 --fixed-threshold 0.45 --closing-iters 2 --erosion-iters 1 --z-min -60 --z-max 75 --section-interval 15 --use-3d-analysis --start-z -50 --navigation-line --nav-min-radius 12 --expand-by-shell --expand-threshold 0.5 --expand-max-iters 200 --expand-min-dist-mm 0.0 --vtk-flythrough --no-open
+```
+
+- 代表性产物（本次已回归验证通过）：
+  - `output/20260426_231915/trachea_reconstruction_3d_20260426_231915.html`
+  - `output/20260426_231915/trachea_reconstruction_flythrough_20260426_231915_playable.mp4`
+  - `output/20260426_231915/trachea_reconstruction_flythrough_20260426_231915_playable_sync.json`
+
+### 多路径算法对比（nav-compare，已验证可用）
+
+```bash
+python dicom_trachea_complete.py --dicom .\dicom3 --output trachea_reconstruction --size 512 --iso 0.5 --step 2 --fixed-threshold 0.45 --closing-iters 2 --erosion-iters 1 --z-min -60 --z-max 75 --section-interval 15 --use-3d-analysis --start-z -50 --navigation-line --nav-min-radius 12 --nav-compare --no-cross-sections --expand-by-shell --expand-threshold 0.5 --expand-max-iters 200 --expand-min-dist-mm 0.0 --no-open
+```
+
+- 代表性产物（含 `run_args.json/run_metrics.json`）：
+  - `output/20260426_230210/run_metrics.json`
