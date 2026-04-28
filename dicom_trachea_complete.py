@@ -17,6 +17,7 @@ import pydicom
 import cv2
 from skimage import measure
 from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import binary_closing, binary_erosion, generate_binary_structure
 from scipy.interpolate import splprep, splev
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -46,6 +47,116 @@ try:
     sys.stderr.reconfigure(encoding='utf-8')
 except Exception:
     pass
+
+
+def maybe_run_camera_compare(pipeline_obj, args_obj, out_dir: str) -> None:
+    """
+    目标二实验：相机轨迹对比（切向基线 vs 射线求交）。
+    - 默认不运行；仅当命令行显式开启 --exp-camera-compare 才会执行
+    - 失败只落盘 error 文件，不影响主流程产物（HTML/JSON等）
+    """
+    if not bool(getattr(args_obj, "exp_camera_compare", False)):
+        return
+    try:
+        verts = getattr(pipeline_obj, "trachea_lumen_verts", None)
+        faces = getattr(pipeline_obj, "trachea_lumen_faces", None)
+        path = getattr(pipeline_obj, "navigation_path_plotly", None)
+        if path is None or (hasattr(path, "__len__") and len(path) < 3):
+            path = getattr(pipeline_obj, "centerline_world", None)
+        if verts is None or faces is None or path is None or len(path) < 3:
+            raise RuntimeError("缺少网格或路径（需要 --use-3d-analysis 且生成中心线/导航线）")
+
+        import numpy as _np  # noqa: WPS433
+        from virtual_endoscopy_pyvista import compute_camera_hints as _compute_ray_hints  # noqa: WPS433
+        from virtual_endoscopy_pyvista import _ray_free_length as _ray_free_len  # noqa: WPS433
+        import pyvista as _pv  # noqa: WPS433
+
+        path = _np.asarray(path, dtype=_np.float64)
+        verts = _np.asarray(verts, dtype=_np.float64)
+        faces = _np.asarray(faces, dtype=_np.int64)
+
+        f_flat = _np.empty(faces.shape[0] * 4, dtype=_np.int64)
+        f_flat[0::4] = 3
+        f_flat[1::4] = faces[:, 0]
+        f_flat[2::4] = faces[:, 1]
+        f_flat[3::4] = faces[:, 2]
+        surf = _pv.PolyData(verts, f_flat)
+
+        ray = _compute_ray_hints(verts, faces, path)
+        fwd_ray = _np.asarray(ray.get("fwd", []), dtype=_np.float64)
+        look_ray = _np.asarray(ray.get("lookDist", []), dtype=_np.float64)
+        if fwd_ray.shape[0] != path.shape[0] or look_ray.shape[0] != path.shape[0]:
+            raise RuntimeError("射线求交提示量长度异常")
+
+        # Cam-A：切向基线（forward=折线切向）；lookDist 复用射线结果以隔离 forward 贡献
+        fwd_tan = _np.zeros_like(fwd_ray)
+        for i in range(path.shape[0]):
+            i0 = max(0, i - 1)
+            i1 = min(path.shape[0] - 1, i + 1)
+            t = path[i1] - path[i0]
+            n = float(_np.linalg.norm(t))
+            if n < 1e-12:
+                t = _np.array([0.0, 0.0, 1.0], dtype=_np.float64)
+                n = 1.0
+            fwd_tan[i] = t / n
+        look_tan = look_ray.copy()
+
+        def _delta_theta(fwd):
+            dots = _np.sum(fwd[1:] * fwd[:-1], axis=1)
+            dots = _np.clip(dots, -1.0, 1.0)
+            return _np.arccos(dots)
+
+        def _center_steps(fwd, look):
+            center = path + fwd * look.reshape((-1, 1))
+            return _np.linalg.norm(center[1:] - center[:-1], axis=1)
+
+        def _stats(x):
+            x = _np.asarray(x, dtype=_np.float64)
+            if x.size == 0:
+                return {"mean": None, "p95": None, "max": None}
+            return {"mean": float(_np.mean(x)), "p95": float(_np.percentile(x, 95)), "max": float(_np.max(x))}
+
+        max_len = 90.0
+        tau = 5.0
+        free_ray = _np.array([_ray_free_len(surf, path[i], fwd_ray[i], max_len) for i in range(path.shape[0])], dtype=_np.float64)
+        free_tan = _np.array([_ray_free_len(surf, path[i], fwd_tan[i], max_len) for i in range(path.shape[0])], dtype=_np.float64)
+
+        cam_payload = {
+            "input": {
+                "path_n": int(path.shape[0]),
+                "max_ray_mm": float(max_len),
+                "wall_tau_mm": float(tau),
+                "note": "Cam-A: tangent forward; Cam-B: ray-intersection forward; lookDist uses ray-derived lookDist for both to isolate forward stability.",
+            },
+            "cam_A_baseline_tangent": {
+                "delta_theta_rad": _stats(_delta_theta(fwd_tan)),
+                "center_step": _stats(_center_steps(fwd_tan, look_tan)),
+                "free_len_mm": _stats(free_tan),
+                "wall_hit_rate": float(_np.mean((free_tan < tau).astype(_np.float64))),
+                "p05_free_len_mm": float(_np.percentile(free_tan, 5)),
+            },
+            "cam_B_ray_intersection": {
+                "delta_theta_rad": _stats(_delta_theta(fwd_ray)),
+                "center_step": _stats(_center_steps(fwd_ray, look_ray)),
+                "free_len_mm": _stats(free_ray),
+                "wall_hit_rate": float(_np.mean((free_ray < tau).astype(_np.float64))),
+                "p05_free_len_mm": float(_np.percentile(free_ray, 5)),
+            },
+        }
+
+        out_json = os.path.join(out_dir, "run_camera_metrics.json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(cam_payload, f, ensure_ascii=False, indent=2)
+        print(f"✓ 相机对比指标已保存: {out_json}")
+    except Exception as e:
+        try:
+            err_path = os.path.join(out_dir, "run_camera_metrics.error.txt")
+            with open(err_path, "w", encoding="utf-8") as ef:
+                ef.write("camera_compare_failed\n")
+                ef.write(f"error: {repr(e)}\n")
+        except Exception:
+            pass
+        print(f"⚠ 相机对比实验失败（不影响主流程完成）: {e}")
 
 
 class DicomTrachea3DPipeline:
@@ -2264,6 +2375,7 @@ class DicomTrachea3DPipeline:
             selected_labels: {z_idx: (label_id, centroid, area, mask), ...}
         """
         from scipy import ndimage
+        from skimage import measure as _sk_measure
         
         print("\n" + "="*60)
         print("步骤: 3D连通性分析（充气法）")
@@ -2285,6 +2397,45 @@ class DicomTrachea3DPipeline:
         
         print(f"1. 构建3D二值体数据...")
         print(f"   切片数: {num_slices}, ROI尺寸: {roi_h}×{roi_w}")
+
+        def _stage_metrics(mask3d_u8):
+            """阶段实验指标：连通性/碎片/泄漏趋势（不依赖GT）。"""
+            try:
+                m = np.asarray(mask3d_u8)
+                m = (m > 0).astype(np.uint8)
+                total = int(np.sum(m))
+                if total <= 0:
+                    return {
+                        "mask_voxels": 0,
+                        "num_components": 0,
+                        "largest_component_voxels": 0,
+                        "r_cc": 0.0,
+                        "bbox_volume_voxels": 0,
+                        "r_bbox": 0.0,
+                    }
+                lab = _sk_measure.label(m, connectivity=1)
+                counts = np.bincount(lab.ravel())
+                num_components = int(len(counts) - 1) if len(counts) > 1 else 0
+                largest = int(np.max(counts[1:])) if len(counts) > 1 else 0
+                r_cc = float(largest / max(1, total))
+
+                zz, yy, xx = np.where(m > 0)
+                z0, z1 = int(np.min(zz)), int(np.max(zz))
+                y0, y1 = int(np.min(yy)), int(np.max(yy))
+                x0, x1 = int(np.min(xx)), int(np.max(xx))
+                bbox_vol = int((z1 - z0 + 1) * (y1 - y0 + 1) * (x1 - x0 + 1))
+                r_bbox = float(total / max(1, bbox_vol))
+                return {
+                    "mask_voxels": int(total),
+                    "num_components": int(num_components),
+                    "largest_component_voxels": int(largest),
+                    "r_cc": float(r_cc),
+                    "bbox_volume_voxels": int(bbox_vol),
+                    "r_bbox": float(r_bbox),
+                    "bbox_zyx": {"z0": z0, "z1": z1, "y0": y0, "y1": y1, "x0": x0, "x1": x1},
+                }
+            except Exception:
+                return None
         
         # 构建3D二值体数据（严格阈值：用于“种子连通域”）
         volume_binary = np.zeros((num_slices, roi_h, roi_w), dtype=np.uint8)
@@ -2370,6 +2521,23 @@ class DicomTrachea3DPipeline:
             volume_binary[z_idx] = binary
             if expand_enabled and volume_binary_expand is not None and binary2 is not None:
                 volume_binary_expand[z_idx] = binary2
+
+        # 阶段实验：S0（初始候选掩膜，未做3D closing/erosion）
+        stage_metrics = None
+        exp_stage = bool(getattr(self, "_exp_airway_stages", False))
+        if exp_stage:
+            stage_metrics = {}
+            try:
+                stage_metrics["S0_init_candidate"] = {
+                    "desc": "初始候选掩膜（阈值+2D膨胀后，尚未做3D closing/erosion）",
+                    "metrics": None,
+                }
+                stage_metrics["S0_init_candidate"]["metrics"] = {
+                    **(_stage_metrics(volume_binary) or {}),
+                    "note": "该口径是候选空间，包含体外空气/伪影，主要用于展示后续技术的净化效果。",
+                }
+            except Exception:
+                pass
         
         print(f"   二值化完成，非零体素: {np.sum(volume_binary > 0):,}")
         if expand_enabled and volume_binary_expand is not None and expand_threshold is not None:
@@ -2401,6 +2569,18 @@ class DicomTrachea3DPipeline:
         
         closed_voxels = np.sum(volume_binary > 0)
         print(f"   闭合后体素: {closed_voxels:,}")
+
+        # 阶段实验：S0'（3D closing/erosion 后的候选掩膜）
+        if exp_stage and stage_metrics is not None:
+            try:
+                stage_metrics["S0_after_3d_morph"] = {
+                    "desc": "候选掩膜（3D closing/erosion 后）",
+                    "metrics": {
+                        **(_stage_metrics(volume_binary) or {}),
+                    },
+                }
+            except Exception:
+                pass
         
         # 2. 选择种子点
         print(f"\n2. 选择种子点...")
@@ -2495,6 +2675,18 @@ class DicomTrachea3DPipeline:
         trachea_volume_raw = np.sum(trachea_mask_3d)
         
         print(f"   气管连通域(原始): label={seed_label_3d}, 体积={trachea_volume_raw:,}体素")
+
+        # 阶段实验：S1（种子引导 3D 连通域提取后，尚未做泄漏控制）
+        if exp_stage and stage_metrics is not None:
+            try:
+                stage_metrics["S1_seed_cc_raw"] = {
+                    "desc": "3D连通域提取结果（包含种子label的连通域，未做泄漏控制）",
+                    "metrics": {
+                        **(_stage_metrics(trachea_mask_3d.astype(np.uint8)) or {}),
+                    },
+                }
+            except Exception:
+                pass
         
         # ============================================================
         # ⭐ 泄漏控制策略
@@ -2544,6 +2736,18 @@ class DicomTrachea3DPipeline:
         trachea_volume = np.sum(trachea_mask_3d)
         print(f"   泄漏控制后体积: {trachea_volume:,}体素 (移除{trachea_volume_raw - trachea_volume:,})")
 
+        # 阶段实验：S1'（泄漏控制后）
+        if exp_stage and stage_metrics is not None:
+            try:
+                stage_metrics["S1_after_leak_control"] = {
+                    "desc": "泄漏控制后（逐层面积异常修正）",
+                    "metrics": {
+                        **(_stage_metrics(trachea_mask_3d.astype(np.uint8)) or {}),
+                    },
+                }
+            except Exception:
+                pass
+
         # ============================================================
         # ⭐ 区域扩展（受约束充气/形态学重建）：补齐细小管腔的断连
         # ============================================================
@@ -2588,6 +2792,20 @@ class DicomTrachea3DPipeline:
                 print(f"   约束阈值: {float(expand_threshold):g}")
                 print(f"   扩展迭代: {it} 次")
                 print(f"   体积变化: {before:,} -> {after:,} （+{after - before:,}）")
+
+        # 阶段实验：S2（扩展后；若未启用扩展，则此阶段等同于泄漏控制后）
+        if exp_stage and stage_metrics is not None:
+            try:
+                stage_metrics["S2_after_constrained_expand"] = {
+                    "desc": "约束式扩展后（若未启用expand，则与上一阶段一致）",
+                    "expand_enabled": bool(expand_enabled),
+                    "expand_threshold": float(expand_threshold) if expand_threshold is not None else None,
+                    "metrics": {
+                        **(_stage_metrics(trachea_mask_3d.astype(np.uint8)) or {}),
+                    },
+                }
+            except Exception:
+                pass
         
         # 5. 提取每个切片的结果（进行圆形度评分，提取中心线）
         print(f"\n5. 提取各切片气管区域（圆形度评分）...")
@@ -2950,6 +3168,18 @@ class DicomTrachea3DPipeline:
             # 更新体积
             trachea_volume = np.sum(trachea_mask_3d)
             print(f"   中心线约束后体积: {trachea_volume:,}体素")
+
+            # 阶段实验：S3（最终掩膜：中心线约束后）
+            if exp_stage and stage_metrics is not None:
+                try:
+                    stage_metrics["S3_final_after_centerline_constraint"] = {
+                        "desc": "最终掩膜（中心线距离约束后，用于后续重建/导航）",
+                        "metrics": {
+                            **(_stage_metrics(trachea_mask_3d.astype(np.uint8)) or {}),
+                        },
+                    }
+                except Exception:
+                    pass
             
             # ⭐ 更新selected_labels中的mask，使用过滤后的trachea_mask_3d
             print(f"   更新selected_labels中的mask...")
@@ -3013,6 +3243,25 @@ class DicomTrachea3DPipeline:
         # 保存3D掩码供后续使用
         self.trachea_mask_3d = trachea_mask_3d
         self.roi_offset = (x1, y1)
+
+        # 阶段实验：落盘（不影响正常模式）
+        if exp_stage and stage_metrics is not None:
+            try:
+                # 写入 experiment_args，最终会进入 run_metrics.json
+                self.experiment_args["_airway_stage_metrics"] = stage_metrics
+            except Exception:
+                pass
+            try:
+                run_dir = None
+                if isinstance(getattr(self, "experiment_args", None), dict):
+                    run_dir = self.experiment_args.get("_run_dir", None)
+                if run_dir:
+                    outp = os.path.join(str(run_dir), "airway_stage_metrics.json")
+                    with open(outp, "w", encoding="utf-8") as f:
+                        json.dump(stage_metrics, f, ensure_ascii=False, indent=2)
+                    print(f"✓ 阶段指标已保存: {outp}")
+            except Exception:
+                pass
         
         return selected_labels
     
@@ -6436,6 +6685,24 @@ def main():
         metavar='OUT.mp4',
         help='导出 PyVista 离屏虚拟内镜 MP4（内壁网格+射线锥前向）；不写路径则输出到 output/<前缀>_flythrough_<时间>.mp4。需: pip install pyvista imageio-ffmpeg',
     )
+
+    # 实验模式开关：默认关闭，避免干扰既有功能（横截面/导航/视频等）。
+    # 仅当显式开启时，才会自动执行“目标一：气道区域提取 A/B 对照实验”。
+    parser.add_argument(
+        '--exp-airway-extraction',
+        action='store_true',
+        help='【实验模式】执行“气道区域提取”A/B 对照：同一参数下分别启用/禁用 --use-3d-analysis，并分别产出 HTML + run_args/run_metrics 与汇总 JSON（默认关闭，不影响正常功能）。',
+    )
+    parser.add_argument(
+        '--exp-airway-stages',
+        action='store_true',
+        help='【实验模式】导出气道区域提取的阶段结果指标（S0初始候选→S0闭合→S1连通→S1泄漏控制→S2扩展→S3中心线约束后最终），写入 run_metrics.json 与 airway_stage_metrics.json（默认关闭，不影响正常功能）。',
+    )
+    parser.add_argument(
+        '--exp-camera-compare',
+        action='store_true',
+        help='【实验模式】相机轨迹对比：切向基线 vs 射线求交（离线计算 forward/lookDist 并输出抖动指标到 run_camera_metrics.json；默认关闭，不影响正常功能）。',
+    )
     
     args = parser.parse_args()
 
@@ -6481,7 +6748,299 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     print(f"📦 本次输出目录: {run_dir}{os.sep}")
 
-    # 输出文件路径
+    def _compute_airway_extraction_metrics(mask3d):
+        """
+        目标一实验指标：不依赖GT的代理指标（连通性/碎片/泄漏趋势）。
+        - r_cc: 最大连通域体素占比（越接近1越好）
+        - num_components: 连通域数量（越少越好）
+        - r_bbox: mask体素数 / bbox体素数（过低常意味着稀疏泄漏/飞点；需结合可视化判读）
+        """
+        try:
+            m = np.asarray(mask3d)
+            m = (m > 0).astype(np.uint8)
+            total = int(np.sum(m))
+            if total <= 0:
+                return {
+                    "mask_voxels": 0,
+                    "num_components": 0,
+                    "largest_component_voxels": 0,
+                    "r_cc": 0.0,
+                    "bbox_volume_voxels": 0,
+                    "r_bbox": 0.0,
+                }
+
+            lab = measure.label(m, connectivity=1)
+            # label: 0为背景
+            counts = np.bincount(lab.ravel())
+            num_components = int(len(counts) - 1) if len(counts) > 1 else 0
+            largest = int(np.max(counts[1:])) if len(counts) > 1 else 0
+            r_cc = float(largest / max(1, total))
+
+            zz, yy, xx = np.where(m > 0)
+            z0, z1 = int(np.min(zz)), int(np.max(zz))
+            y0, y1 = int(np.min(yy)), int(np.max(yy))
+            x0, x1 = int(np.min(xx)), int(np.max(xx))
+            bbox_vol = int((z1 - z0 + 1) * (y1 - y0 + 1) * (x1 - x0 + 1))
+            r_bbox = float(total / max(1, bbox_vol))
+
+            return {
+                "mask_voxels": int(total),
+                "num_components": int(num_components),
+                "largest_component_voxels": int(largest),
+                "r_cc": float(r_cc),
+                "bbox_volume_voxels": int(bbox_vol),
+                "r_bbox": float(r_bbox),
+                "bbox_zyx": {"z0": z0, "z1": z1, "y0": y0, "y1": y1, "x0": x0, "x1": x1},
+            }
+        except Exception:
+            return None
+
+    def _compute_airway_extraction_metrics_from_volume(
+        vol_zyx,
+        *,
+        fixed_threshold: float | None,
+        closing_iters: int,
+        erosion_iters: int,
+    ):
+        """
+        用“体数据 volume（已归一化到[0,1]）”构造一个可比的代理 3D mask，用于实验对照：
+        - mask = (volume < fixed_threshold)  （固定阈值时）
+        然后做 3D closing/erosion（迭代次数来自命令行），再计算连通/碎片/泄漏代理指标。
+
+        说明：
+        - 该指标不影响任何既有可视化/导航/横截面功能，只在实验模式下写入 run_metrics.json；
+        - 用于让 A/B 即便内部是否生成 trachea_mask_3d 不一致，也能得到“同口径可比”的指标表。
+        """
+        if fixed_threshold is None:
+            return None
+        try:
+            v = np.asarray(vol_zyx, dtype=np.float32)
+            if v.ndim != 3 or v.size == 0:
+                return None
+            m = (v < float(fixed_threshold))
+            st = generate_binary_structure(3, 1)
+            for _ in range(max(0, int(closing_iters))):
+                m = binary_closing(m, structure=st)
+            for _ in range(max(0, int(erosion_iters))):
+                m = binary_erosion(m, structure=st)
+            return _compute_airway_extraction_metrics(m.astype(np.uint8))
+        except Exception:
+            return None
+
+    def _run_once(args_local, run_dir_local, ts_local, *, force_auto_open=None, tag=None):
+        # 输出文件路径
+        output_html_local = os.path.join(run_dir_local, f"{args_local.output}_3d_{ts_local}.html")
+        fly_mp4_local = None
+        if args_local.vtk_flythrough is not None:
+            if args_local.vtk_flythrough == '':
+                fly_mp4_local = os.path.join(run_dir_local, f"{args_local.output}_flythrough_{ts_local}.mp4")
+            else:
+                fly_mp4_local = args_local.vtk_flythrough
+
+        # 创建流程对象
+        pipeline_local = DicomTrachea3DPipeline(
+            args_local.dicom,
+            args_local.output,
+            percentile=args_local.percentile,
+            closing_iters=args_local.closing_iters,
+            erosion_iters=args_local.erosion_iters,
+            fixed_threshold=args_local.fixed_threshold,
+        )
+        pipeline_local.experiment_intro = args_local.intro or ""
+        pipeline_local.experiment_args = vars(args_local).copy()
+        pipeline_local.experiment_started_at = datetime.datetime.now()
+        pipeline_local._exp_airway_stages = bool(getattr(args_local, "exp_airway_stages", False))
+        try:
+            pipeline_local.experiment_args["_run_dir"] = os.path.abspath(str(run_dir_local))
+            pipeline_local.experiment_args["_output_html"] = os.path.abspath(str(output_html_local)) if output_html_local else None
+            if tag:
+                pipeline_local.experiment_args["_exp_tag"] = str(tag)
+        except Exception:
+            pass
+        pipeline_local.expand_cfg = {
+            "enabled": bool(args_local.expand_trachea),
+            "threshold": args_local.expand_threshold,
+            "max_iters": int(args_local.expand_max_iters),
+            "min_dist_mm": float(args_local.expand_min_dist_mm),
+        }
+
+        # 运行参数落盘
+        try:
+            run_args_json = os.path.join(run_dir_local, "run_args.json")
+            with open(run_args_json, "w", encoding="utf-8") as f:
+                json.dump(vars(args_local), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        auto_open_local = (args_local.open and (not args_local.no_open))
+        if force_auto_open is not None:
+            auto_open_local = bool(force_auto_open)
+
+        success_local = pipeline_local.run_full_pipeline(
+            z_min=args_local.z_min,
+            z_max=args_local.z_max,
+            downsample_size=args_local.size,
+            iso_value=args_local.iso,
+            step_size=args_local.step,
+            output_html=output_html_local,
+            show_cross_sections=not args_local.no_cross_sections,
+            cross_section_interval=args_local.section_interval,
+            show_endoscopy=args_local.endoscopy,
+            auto_open=auto_open_local,
+            use_3d_analysis=args_local.use_3d_analysis,
+            use_flood_fill=not args_local.use_propagation,  # 默认使用充气法
+            start_z=args_local.start_z,
+            start_idx=args_local.start_idx,
+            navigation_line=args_local.navigation_line,
+            nav_min_turn_radius_mm=args_local.nav_min_radius,
+            nav_algorithm=args_local.nav_algorithm,
+            nav_compare=args_local.nav_compare,
+            vtk_flythrough_mp4=fly_mp4_local,
+        )
+
+        # 目标二实验：相机轨迹对比（普通模式/实验模式共用）
+        maybe_run_camera_compare(pipeline_local, args_local, run_dir_local)
+
+        # 指标落盘
+        try:
+            ended_at = datetime.datetime.now()
+            safe_args = {}
+            for k, v in (pipeline_local.experiment_args or {}).items():
+                try:
+                    json.dumps(v, ensure_ascii=False)
+                    safe_args[k] = v
+                except Exception:
+                    safe_args[k] = str(v)
+            safe_args["_internal"] = {
+                "percentile": pipeline_local.percentile,
+                "roi_size": pipeline_local.roi_size,
+                "kernel_size": list(pipeline_local.kernel_size) if isinstance(pipeline_local.kernel_size, tuple) else pipeline_local.kernel_size,
+                "2d_morph": "dilate(iter=1)",
+                "3d_closing_iterations": pipeline_local.closing_iters,
+                "3d_erosion_iterations": pipeline_local.erosion_iters,
+            }
+            if getattr(pipeline_local, "navigation_meta", None):
+                safe_args["_navigation_metrics"] = pipeline_local.navigation_meta
+
+            # 目标一实验指标（仅实验模式需要）：从 3D 掩码提取连通/碎片/泄漏代理指标
+            if args_local.exp_airway_extraction:
+                m3d_local = getattr(pipeline_local, "trachea_mask_3d", None)
+                safe_args["_airway_extraction_metrics"] = _compute_airway_extraction_metrics(m3d_local) if m3d_local is not None else None
+                # 代理指标（A/B 同口径可比）：直接从 pipeline.volume 阈值化得到
+                safe_args["_airway_extraction_metrics_proxy_volume"] = _compute_airway_extraction_metrics_from_volume(
+                    getattr(pipeline_local, "volume", None),
+                    fixed_threshold=args_local.fixed_threshold,
+                    closing_iters=args_local.closing_iters,
+                    erosion_iters=args_local.erosion_iters,
+                )
+
+            # 输入指纹
+            try:
+                dz_mm, dy_mm, dx_mm = pipeline_local._estimate_spacing_mm()
+            except Exception:
+                dz_mm, dy_mm, dx_mm = None, None, None
+            try:
+                m3d = getattr(pipeline_local, "trachea_mask_3d", None)
+                if m3d is not None:
+                    m_sum = int(np.sum(m3d > 0))
+                    m_shape = list(m3d.shape)
+                    m_dtype = str(getattr(m3d, "dtype", ""))
+                else:
+                    m_sum, m_shape, m_dtype = None, None, None
+            except Exception:
+                m_sum, m_shape, m_dtype = None, None, None
+            safe_args["_input_fingerprint"] = {
+                "dicom_dir": os.path.abspath(str(args_local.dicom)) if args_local.dicom is not None else None,
+                "z_min": float(args_local.z_min) if args_local.z_min is not None else None,
+                "z_max": float(args_local.z_max) if args_local.z_max is not None else None,
+                "seed": {"start_z": float(args_local.start_z) if args_local.start_z is not None else None, "start_idx": int(args_local.start_idx) if args_local.start_idx is not None else None},
+                "spacing_mm": {"dz": float(dz_mm) if dz_mm is not None else None, "dy": float(dy_mm) if dy_mm is not None else None, "dx": float(dx_mm) if dx_mm is not None else None},
+                "mask_3d": {"shape": m_shape, "sum": m_sum, "dtype": m_dtype},
+                "downsample_size": int(args_local.size) if args_local.size is not None else None,
+                "iso_value": float(args_local.iso) if args_local.iso is not None else None,
+                "step_size": int(args_local.step) if args_local.step is not None else None,
+            }
+            safe_args["_run"] = {
+                "started_at": pipeline_local.experiment_started_at.strftime("%Y-%m-%d %H:%M:%S") if isinstance(getattr(pipeline_local, "experiment_started_at", None), datetime.datetime) else None,
+                "ended_at": ended_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "output_html": os.path.basename(output_html_local) if output_html_local else None,
+                "success": bool(success_local),
+            }
+            run_metrics_json = os.path.join(run_dir_local, "run_metrics.json")
+            with open(run_metrics_json, "w", encoding="utf-8") as f:
+                json.dump(safe_args, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        return bool(success_local), output_html_local
+
+    # 实验模式：阶段对比（用于 3.2.6）
+    if getattr(args, "exp_airway_stages", False):
+        # 阶段实验强制启用 3D 分析（否则没有阶段链路意义）
+        args.use_3d_analysis = True
+        exp_root = os.path.join(output_dir, f"{ts}_exp_airway_stages")
+        if os.path.exists(exp_root):
+            k = 2
+            while os.path.exists(f"{exp_root}_{k}"):
+                k += 1
+            exp_root = f"{exp_root}_{k}"
+        os.makedirs(exp_root, exist_ok=True)
+        print(f"🧪 实验模式已启用：气道区域提取阶段指标导出")
+        print(f"📦 实验输出目录: {exp_root}{os.sep}")
+        ok_s, html_s = _run_once(args, exp_root, ts, force_auto_open=False, tag="airway_stages")
+        return 0 if ok_s else 1
+
+    # 实验模式：目标一（气道区域提取 A/B 对照）
+    if args.exp_airway_extraction:
+        # 说明：实验模式下会跑两次（A/B），为避免弹出两个浏览器窗口，默认强制 auto_open=False。
+        exp_root = os.path.join(output_dir, f"{ts}_exp_airway_extraction")
+        if os.path.exists(exp_root):
+            k = 2
+            while os.path.exists(f"{exp_root}_{k}"):
+                k += 1
+            exp_root = f"{exp_root}_{k}"
+        os.makedirs(exp_root, exist_ok=True)
+        print(f"🧪 实验模式已启用：气道区域提取 A/B 对照")
+        print(f"📦 实验输出目录: {exp_root}{os.sep}")
+
+        # A: Proposed（按用户命令行设置，通常 use_3d_analysis=True）
+        a_args = argparse.Namespace(**vars(args))
+        a_args.use_3d_analysis = True
+        a_dir = os.path.join(exp_root, "A_use_3d_analysis")
+        os.makedirs(a_dir, exist_ok=True)
+        ok_a, html_a = _run_once(a_args, a_dir, ts, force_auto_open=False, tag="A_use_3d_analysis")
+
+        # B: Baseline（禁用 3D 分析）
+        b_args = argparse.Namespace(**vars(args))
+        b_args.use_3d_analysis = False
+        b_dir = os.path.join(exp_root, "B_no_3d_analysis")
+        os.makedirs(b_dir, exist_ok=True)
+        ok_b, html_b = _run_once(b_args, b_dir, ts, force_auto_open=False, tag="B_no_3d_analysis")
+
+        # 汇总
+        try:
+            summary = {
+                "experiment": "airway_extraction_ab",
+                "ts": ts,
+                "dicom": os.path.abspath(str(args.dicom)) if args.dicom is not None else None,
+                "A": {"run_dir": os.path.abspath(a_dir), "html": os.path.abspath(html_a) if html_a else None, "success": bool(ok_a)},
+                "B": {"run_dir": os.path.abspath(b_dir), "html": os.path.abspath(html_b) if html_b else None, "success": bool(ok_b)},
+                "note": "A 与 B 仅切换 use_3d_analysis，其余参数应保持一致；指标见各自 run_metrics.json::_airway_extraction_metrics。",
+            }
+            with open(os.path.join(exp_root, "exp_summary.json"), "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        print("\n" + "=" * 60)
+        print("🧪 实验完成（A/B 对照）")
+        print("=" * 60)
+        print(f"  - A(use_3d_analysis): {'✓' if ok_a else '✗'}  {html_a}")
+        print(f"  - B(no_3d_analysis):  {'✓' if ok_b else '✗'}  {html_b}")
+        print(f"  - 汇总: {os.path.join(exp_root, 'exp_summary.json')}")
+        return 0 if (ok_a and ok_b) else 1
+
+    # 输出文件路径（普通模式）
     output_html = os.path.join(run_dir, f"{args.output}_3d_{ts}.html")
     fly_mp4 = None
     if args.vtk_flythrough is not None:
@@ -6558,6 +7117,9 @@ def main():
         nav_compare=args.nav_compare,
         vtk_flythrough_mp4=fly_mp4,
     )
+
+    # 目标二实验：相机轨迹对比（普通模式）
+    maybe_run_camera_compare(pipeline, args, run_dir)
 
     # 运行产物最小集（工程化可复现）：参数+指标统一落盘到 run_metrics.json
     try:
